@@ -13,7 +13,10 @@ import (
 	"time"
 
 	panel "github.com/wyx2685/v2node/api/v2board"
+	"github.com/wyx2685/v2node/core/proxy/nextv1"
+	"github.com/xtls/xray-core/app/proxyman"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/inbound"
 	"github.com/xtls/xray-core/infra/conf"
@@ -49,6 +52,9 @@ func (v *V2Core) addInbound(config *core.InboundHandlerConfig) error {
 
 // BuildInbound build Inbound config for different protocol
 func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerConfig, error) {
+	if nodeInfo.Type == "next-v1" {
+		return buildNextV1(nodeInfo, tag)
+	}
 	in := &coreConf.InboundDetourConfig{}
 	var err error
 	switch nodeInfo.Type {
@@ -189,6 +195,71 @@ func buildInbound(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerCon
 	in.Tag = tag
 	return in.Build()
 }
+
+func buildNextV1(nodeInfo *panel.NodeInfo, tag string) (*core.InboundHandlerConfig, error) {
+	if nodeInfo.Common == nil {
+		return nil, errors.New("Next-V1 common node config is missing")
+	}
+	serverPort := nodeInfo.Common.ServerPort
+	if serverPort == 0 {
+		serverPort = 24443
+	}
+	if serverPort < 1 || serverPort > 65535 {
+		return nil, fmt.Errorf("invalid Next-V1 inner server port %d", serverPort)
+	}
+	acceptProxyProtocol := true
+	if len(nodeInfo.Common.NetworkSettings) > 0 {
+		networkSettings := struct {
+			AcceptProxyProtocol *bool `json:"acceptProxyProtocol"`
+		}{}
+		if err := json.Unmarshal(nodeInfo.Common.NetworkSettings, &networkSettings); err != nil {
+			return nil, fmt.Errorf("unmarshal Next-V1 network settings: %w", err)
+		}
+		if networkSettings.AcceptProxyProtocol != nil {
+			acceptProxyProtocol = *networkSettings.AcceptProxyProtocol
+		}
+	}
+	tcp := coreConf.TransportProtocol("tcp")
+	streamConfig := &coreConf.StreamConfig{
+		Network: &tcp,
+		SocketSettings: &coreConf.SocketConfig{
+			AcceptProxyProtocol:  acceptProxyProtocol,
+			TrustedXForwardedFor: nodeInfo.Common.TrustedXForwardedFor,
+		},
+	}
+	streamSettings, err := streamConfig.Build()
+	if err != nil {
+		return nil, fmt.Errorf("build Next-V1 stream settings: %w", err)
+	}
+	portList := (&coreConf.PortList{Range: []coreConf.PortRange{{
+		From: uint32(serverPort),
+		To:   uint32(serverPort),
+	}}}).Build()
+	listen := (&coreConf.Address{Address: net.ParseAddress("127.0.0.1")}).Build()
+	sniffing, err := (&coreConf.SniffingConfig{
+		Enabled:      true,
+		DestOverride: coreConf.StringList{"http", "tls", "quic"},
+	}).Build()
+	if err != nil {
+		return nil, fmt.Errorf("build Next-V1 sniffing settings: %w", err)
+	}
+	receiver := &proxyman.ReceiverConfig{
+		PortList:         portList,
+		Listen:           listen,
+		StreamSettings:   streamSettings,
+		SniffingSettings: sniffing,
+	}
+	return &core.InboundHandlerConfig{
+		Tag:              tag,
+		ReceiverSettings: serial.ToTypedMessage(receiver),
+		ProxySettings: serial.ToTypedMessage(&nextv1.Config{
+			MaxTimeSkewSeconds: uint32(defaultNextV1TimeSkew / time.Second),
+			ReplayCapacity:     65536,
+		}),
+	}, nil
+}
+
+const defaultNextV1TimeSkew = 120 * time.Second
 
 func buildVLess(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig) error {
 	v := nodeInfo.Common
@@ -489,7 +560,7 @@ func buildAnyTLS(nodeInfo *panel.NodeInfo, inbound *coreConf.InboundDetourConfig
 	inbound.Protocol = "anytls"
 	v := nodeInfo.Common
 	settings := &coreConf.AnyTLSServerConfig{
-		PaddingScheme: v.PaddingScheme,
+		PaddingScheme: []string(v.PaddingScheme),
 	}
 	t := coreConf.TransportProtocol(v.Network)
 	inbound.StreamSetting = &coreConf.StreamConfig{Network: &t}

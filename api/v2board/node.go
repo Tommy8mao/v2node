@@ -55,13 +55,39 @@ type CommonNode struct {
 	CongestionControl string `json:"congestion_control"`
 	ZeroRTTHandshake  bool   `json:"zero_rtt_handshake"`
 	//anytls
-	PaddingScheme []string `json:"padding_scheme,omitempty"`
+	PaddingScheme PaddingScheme `json:"padding_scheme,omitempty"`
 	//hysteria hysteria2
 	UpMbps                  int    `json:"up_mbps"`
 	DownMbps                int    `json:"down_mbps"`
 	Obfs                    string `json:"obfs"`
 	ObfsPassword            string `json:"obfs_password"`
 	Ignore_Client_Bandwidth bool   `json:"ignore_client_bandwidth"`
+}
+
+// PaddingScheme is a string list for AnyTLS. Early Next-V1 panel builds used
+// the same JSON column for a client-only {min,max} object; accept and discard
+// that shape so a stale panel cannot prevent v2node from starting.
+type PaddingScheme []string
+
+func (p *PaddingScheme) UnmarshalJSON(data []byte) error {
+	if string(data) == "null" {
+		*p = nil
+		return nil
+	}
+	var values []string
+	if err := json.Unmarshal(data, &values); err == nil {
+		*p = values
+		return nil
+	}
+	var nextV1Padding struct {
+		Min *int `json:"min"`
+		Max *int `json:"max"`
+	}
+	if err := json.Unmarshal(data, &nextV1Padding); err != nil || (nextV1Padding.Min == nil && nextV1Padding.Max == nil) {
+		return fmt.Errorf("decode padding_scheme: expected string list or Next-V1 min/max object")
+	}
+	*p = nil
+	return nil
 }
 
 type Route struct {
@@ -162,7 +188,7 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	case "vmess", "trojan", "hysteria2", "tuic", "anytls", "vless":
 		node.Type = cm.Protocol
 		node.Security = cm.Tls
-	case "shadowsocks":
+	case "shadowsocks", "next-v1":
 		node.Type = cm.Protocol
 		node.Security = 0
 	default:

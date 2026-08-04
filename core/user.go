@@ -11,6 +11,7 @@ import (
 	"github.com/wyx2685/v2node/common/counter"
 	"github.com/wyx2685/v2node/common/format"
 	"github.com/wyx2685/v2node/core/app/dispatcher"
+	"github.com/wyx2685/v2node/core/proxy/nextv1"
 	"github.com/xtls/xray-core/common/protocol"
 	"github.com/xtls/xray-core/common/serial"
 	"github.com/xtls/xray-core/infra/conf"
@@ -131,6 +132,8 @@ func (v *V2Core) AddUsers(p *AddUsersParams) (added int, err error) {
 		users = buildTuicUsers(p.Tag, p.Users)
 	case "anytls":
 		users = buildAnyTLSUsers(p.Tag, p.Users)
+	case "next-v1":
+		users = buildNextV1Users(p.Tag, p.Users)
 	default:
 		return 0, fmt.Errorf("unsupported node type: %s", p.NodeInfo.Type)
 	}
@@ -321,4 +324,18 @@ func buildAnyTLSUser(tag string, userInfo *panel.UserInfo) (user *protocol.User)
 		Email:   format.UserTag(tag, userInfo.Uuid),
 		Account: serial.ToTypedMessage(anyTLSAccount),
 	}
+}
+
+func buildNextV1Users(tag string, userInfo []panel.UserInfo) (users []*protocol.User) {
+	users = make([]*protocol.User, len(userInfo))
+	for i := range userInfo {
+		users[i] = &protocol.User{
+			Level: 0,
+			Email: format.UserTag(tag, userInfo[i].Uuid),
+			Account: serial.ToTypedMessage(&nextv1.Account{
+				Password: userInfo[i].Uuid,
+			}),
+		}
+	}
+	return users
 }

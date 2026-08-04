@@ -1,0 +1,14 @@
+syntax = "proto3";
+
+package v2node.core.proxy.nextv1;
+
+option go_package = "github.com/wyx2685/v2node/core/proxy/nextv1";
+
+message Account {
+  string password = 1;
+}
+
+message Config {
+  uint32 max_time_skew_seconds = 1;
+  uint32 replay_capacity = 2;
+}
