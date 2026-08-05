@@ -9,7 +9,7 @@ readonly V2NODE_CONFIG_DIR="/etc/v2node"
 readonly NEXTV1_DIR="/etc/next-v1"
 readonly HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 readonly DEFAULT_RELEASE_REPOSITORY="Tommy8mao/v2node"
-readonly DEFAULT_RELEASE_VERSION="v0.4.4-next-v1.1"
+readonly DEFAULT_RELEASE_VERSION="v0.4.4-next-v1.2"
 
 frontend_port=443
 backend_host="127.0.0.1"
@@ -230,7 +230,7 @@ validate_args() {
 }
 
 validate_existing_v2node_config() {
-    [[ -f "$V2NODE_CONFIG_DIR/config.json" && -n "$api_host" && -n "$node_id" ]] || return
+    [[ -f "$V2NODE_CONFIG_DIR/config.json" && -n "$api_host" && -n "$node_id" ]] || return 0
     command -v jq >/dev/null || die "jq is required to validate the existing v2node config"
     local configured_host configured_node_id
     configured_host=$(jq -er '.Nodes[0].ApiHost | select(type == "string" and length > 0)' \
@@ -687,7 +687,7 @@ EOF
 
 publish_client_bundle() {
     local endpoint payload_dir payload server_ca_file fingerprint response
-    [[ -n "$api_host" && -n "$node_id" && -s "$bootstrap_token_file" ]] || return
+    [[ -n "$api_host" && -n "$node_id" && -s "$bootstrap_token_file" ]] || return 0
     endpoint="${api_host%/}/api/v2/server/next-v1/bootstrap"
     payload_dir=$(mktemp -d "${TMPDIR:-/tmp}/next-v1-bootstrap.XXXXXX")
     payload="$payload_dir/payload.json"
@@ -796,4 +796,6 @@ main() {
     print_summary
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
