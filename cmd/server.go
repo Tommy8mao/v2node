@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	_ "net/http/pprof"
@@ -11,6 +12,7 @@ import (
 
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
+	managedHAProxy "github.com/wyx2685/v2node/common/haproxy"
 	"github.com/wyx2685/v2node/conf"
 	"github.com/wyx2685/v2node/core"
 	"github.com/wyx2685/v2node/limiter"
@@ -18,8 +20,9 @@ import (
 )
 
 var (
-	config string
-	watch  bool
+	config             string
+	watch              bool
+	errReloadPreflight = errors.New("reload preflight rejected")
 )
 
 var serverCommand = cobra.Command{
@@ -96,6 +99,11 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		log.WithField("err", err).Error("Start core failed")
 		return
 	}
+	if err := managedHAProxy.NewManager().Apply(nodes.NodeInfos); err != nil {
+		_ = v2core.Close()
+		log.WithField("err", err).Error("Configure Next-V1 HAProxy failed")
+		return
+	}
 	defer v2core.Close()
 	//node
 	err = nodes.Start(c.NodeConfigs, v2core)
@@ -131,6 +139,10 @@ func serverHandle(_ *cobra.Command, _ []string) {
 		case <-reloadCh:
 			log.Info("收到重启信号，正在重新加载配置...")
 			if err := reload(config, &nodes, &v2core); err != nil {
+				if errors.Is(err, errReloadPreflight) {
+					log.WithField("err", err).Error("新配置预检失败，继续使用当前节点配置")
+					continue
+				}
 				log.WithField("err", err).Panic("重启失败")
 			}
 			log.Info("重启成功")
@@ -145,16 +157,24 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 		oldReloadCh = (*v2core).ReloadCh
 	}
 
+	newConf := conf.New()
+	if err := newConf.LoadFromPath(config); err != nil {
+		return fmt.Errorf("%w: load config: %v", errReloadPreflight, err)
+	}
+	newNodes, err := node.New(newConf.NodeConfigs)
+	if err != nil {
+		return fmt.Errorf("%w: get node info: %v", errReloadPreflight, err)
+	}
+	haproxyManager := managedHAProxy.NewManager()
+	if err := haproxyManager.Validate(newNodes.NodeInfos); err != nil {
+		return fmt.Errorf("%w: validate Next-V1 HAProxy: %v", errReloadPreflight, err)
+	}
+
 	if err := (*nodes).Close(); err != nil {
 		return err
 	}
 
 	if err := (*v2core).Close(); err != nil {
-		return err
-	}
-
-	newConf := conf.New()
-	if err := newConf.LoadFromPath(config); err != nil {
 		return err
 	}
 
@@ -181,19 +201,19 @@ func reload(config string, nodes **node.Node, v2core **core.V2Core) error {
 		}
 	}
 
-	newNodes, err := node.New(newConf.NodeConfigs)
-	if err != nil {
-		return err
-	}
-
 	newCore := core.New(newConf)
 	// Reattach reload channel
 	newCore.ReloadCh = oldReloadCh
 	if err := newCore.Start(newNodes.NodeInfos); err != nil {
 		return err
 	}
+	if err := haproxyManager.Apply(newNodes.NodeInfos); err != nil {
+		_ = newCore.Close()
+		return fmt.Errorf("configure Next-V1 HAProxy: %w", err)
+	}
 
 	if err := newNodes.Start(newConf.NodeConfigs, newCore); err != nil {
+		_ = newCore.Close()
 		return err
 	}
 

@@ -165,7 +165,8 @@ wait_for_tcp "$PANEL_PORT" "fake panel" "$test_dir/panel.log"
 wait_for_tcp "$TARGET_TCP_PORT" "echo target" "$test_dir/target.log"
 
 echo "==> Starting v2node, HAProxy mTLS and Mihomo"
-start_process "$test_dir/v2node.log" "$test_dir/v2node" server -c "$test_dir/v2node.json" -w=false
+start_process "$test_dir/v2node.log" env NEXT_V1_HAPROXY_MODE=external \
+    "$test_dir/v2node" server -c "$test_dir/v2node.json" -w=false
 wait_for_tcp "$BACKEND_PORT" "v2node" "$test_dir/v2node.log"
 start_process "$test_dir/haproxy.log" haproxy -db -f "$test_dir/haproxy.cfg"
 wait_for_tcp "$PUBLIC_PORT" "HAProxy" "$test_dir/haproxy.log"

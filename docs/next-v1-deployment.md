@@ -3,16 +3,26 @@
 The supported server layout is:
 
 ```text
-Nextin/Mihomo -> TCP 443 HAProxy (TLS 1.3 + required client cert)
-               -> 127.0.0.1:24443 v2node (Next-V1 + PROXY v2)
+Nextin/Mihomo -> TCP 443  HAProxy frontend A -> 127.0.0.1:24443 v2node node A
+               TCP 8443 HAProxy frontend B -> 127.0.0.1:25443 v2node node B
 ```
 
-The loopback port is configured on the Next-V1 panel node and must match the
-installer's `--backend-port`. Do not expose that port in the firewall.
+One v2node process and one HAProxy process can serve multiple panel nodes. Each
+node must use a unique public port and a unique loopback port. The loopback port
+is configured on the Next-V1 panel node and must match the installer's
+`--backend-port`; never expose it in the firewall.
 The installer expects a dedicated HAProxy instance. If it detects existing
 frontend/listen/backend routes, it stops without changing them; inspect the
 timestamped backup and explicitly pass `--replace-haproxy-config` only when
 replacing those routes is intentional.
+
+Each install command upserts its `(panel URL, node ID)` in the shared
+`/etc/v2node/config.json` instead of replacing the other nodes. Certificates and
+the recovery bundle are isolated under `/etc/next-v1/nodes/<instance-key>/`.
+v2node rebuilds the complete HAProxy configuration from all configured Next-V1
+nodes after a successful start or panel-driven reload. Changing a public or
+loopback port in the panel therefore updates HAProxy automatically at the next
+pull interval; `systemctl restart v2node` forces an immediate refresh.
 
 ## First panel bootstrap
 
@@ -21,8 +31,9 @@ to the server. The command downloads the installer and current v2node release
 from `Tommy8mao/v2node`, configures the selected public and loopback ports, and
 posts the generated client identity back to that authenticated panel node. The
 panel validates the certificate/private-key pair before enabling a bootstrap
-node, so no manual certificate copy is required. `/etc/next-v1/client.yaml`
-remains a root-only recovery copy.
+node, so no manual certificate copy is required. The node-specific
+`/etc/next-v1/nodes/<instance-key>/client.yaml` remains a root-only recovery
+copy.
 
 ## Local or first test
 
@@ -33,7 +44,7 @@ node-scoped token through standard input and consumes it during bootstrap.
 
 The script creates a private server CA, a separate private client CA, and one
 shared client certificate. Self-signed server verification uses both the private
-server CA and the SHA-256 pin written into `/etc/next-v1/client.yaml`;
+server CA and the SHA-256 pin written into the node's `client.yaml`;
 `skip-cert-verify` remains false. Re-running with the same server name keeps the
 same identities unless `--rotate-client` is explicitly supplied.
 
@@ -57,8 +68,8 @@ with `--existing-cert /path/to/fullchain.pem --existing-key /path/to/privkey.pem
 Save the node again to authorize a new identity, copy the refreshed command and
 add `--rotate-client`. This replaces the client CA and
 shared certificate, updates HAProxy, and invalidates all previously delivered
-client certificates immediately. Redistribute `/etc/next-v1/client.yaml` only
-through the protected panel subscription path.
+client certificates immediately. Redistribute the node-specific `client.yaml`
+only through the protected panel subscription path.
 
 ## Checks
 

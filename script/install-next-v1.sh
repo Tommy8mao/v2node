@@ -6,10 +6,11 @@ umask 077
 readonly PROGRAM="${0##*/}"
 readonly INSTALL_DIR="/usr/local/v2node"
 readonly V2NODE_CONFIG_DIR="/etc/v2node"
-readonly NEXTV1_DIR="/etc/next-v1"
+readonly NEXTV1_ROOT="/etc/next-v1"
+readonly NEXTV1_NODES_DIR="$NEXTV1_ROOT/nodes"
 readonly HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 readonly DEFAULT_RELEASE_REPOSITORY="Tommy8mao/v2node"
-readonly DEFAULT_RELEASE_VERSION="v0.4.4-next-v1.2"
+readonly DEFAULT_RELEASE_VERSION="v0.4.4-next-v1.3"
 
 frontend_port=443
 backend_host="127.0.0.1"
@@ -34,14 +35,39 @@ staged_binary=""
 rotate_client=false
 replace_haproxy_config=false
 bootstrap_published=false
+node_key=""
+NEXTV1_DIR=""
+activation_rollback_dir=""
+identity_rollback_dir=""
+port_check_token_file=""
 
 cleanup_runtime_files() {
+    if [[ -n "$identity_rollback_dir" ]]; then
+        rollback_identity || true
+    fi
+    if [[ -n "$activation_rollback_dir" ]]; then
+        rollback_activation || true
+    fi
     [[ -n "$api_key_file" ]] && rm -f "$api_key_file" "$api_key_file.next"
     [[ -n "$bootstrap_token_file" ]] && rm -f "$bootstrap_token_file" "$bootstrap_token_file.next"
+    [[ -n "$port_check_token_file" ]] && rm -f "$port_check_token_file"
     [[ -n "$staged_binary" ]] && rm -f "$staged_binary"
     rm -f "$INSTALL_DIR/geoip.dat.next-v1.new" "$INSTALL_DIR/geosite.dat.next-v1.new"
+    rm -f "$V2NODE_CONFIG_DIR/config.json.next-v1.new" \
+        "$V2NODE_CONFIG_DIR/config.json.next-v1.upsert" \
+        /etc/systemd/system/v2node.service.next-v1.new
+    if [[ -n "$activation_rollback_dir" &&
+          "$activation_rollback_dir" == "$NEXTV1_ROOT"/activation-rollback.* ]]; then
+        rm -rf -- "$activation_rollback_dir"
+    fi
+    if [[ -n "$identity_rollback_dir" &&
+          "$identity_rollback_dir" == "$NEXTV1_ROOT"/identity-rollback.* ]]; then
+        rm -rf -- "$identity_rollback_dir"
+    fi
 }
-trap cleanup_runtime_files EXIT
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    trap cleanup_runtime_files EXIT
+fi
 
 usage() {
     cat <<'EOF'
@@ -58,7 +84,7 @@ TLS options:
   --server-name NAME            Certificate DNS name (default: next-v1.local)
   --email ADDRESS               Required with --letsencrypt
   --rotate-client               Replace the shared mTLS client certificate
-  --replace-haproxy-config      Replace an HAProxy config with existing routes
+  --replace-haproxy-config      Authorize takeover of a non-Next-V1 HAProxy config
 
 Service options:
   --frontend-port PORT          HAProxy public port (default: 443)
@@ -74,8 +100,9 @@ Service options:
   --bootstrap-token-stdin       Read the one-time node token from standard input
   -h, --help                    Show this help
 
-The three panel options are only required when /etc/v2node/config.json does not
-already exist. The panel node's Next-V1 backend port must equal --backend-port.
+Each panel node is added to the shared v2node process and receives an isolated
+certificate directory and HAProxy frontend/backend. Re-running a node command
+updates only that node. The panel backend port must equal --backend-port.
 EOF
 }
 
@@ -97,6 +124,16 @@ validate_port() {
     (( 1 <= 10#$1 && 10#$1 <= 65535 )) || die "port out of range: $1"
 }
 
+is_managed_haproxy_config() {
+    [[ -f "$HAPROXY_CONFIG" ]] || return 1
+    local header=""
+    IFS= read -r header < "$HAPROXY_CONFIG" || true
+    case "$header" in
+        '# Managed by Next-V1 installer'|'# Managed by Next-V1 v2node HAProxy manager'|'# Managed by v2node Next-V1 HAProxy manager') return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 validate_server_name() {
     [[ "$1" =~ ^[A-Za-z0-9.-]+$ ]] || die "invalid server name: $1"
     [[ "$1" != .* && "$1" != *. && "$1" != *..* ]] || die "invalid server name: $1"
@@ -114,6 +151,32 @@ server_subject_alt_name() {
     else
         printf 'DNS:%s\n' "$value"
     fi
+}
+
+normalize_api_host() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    while [[ "$value" == */ ]]; do
+        value="${value%/}"
+    done
+    printf '%s\n' "$value"
+}
+
+initialize_node_context() {
+    if [[ -z "$api_host" || -z "$node_id" ]]; then
+        if [[ -f "$V2NODE_CONFIG_DIR/config.json" ]] && command -v jq >/dev/null 2>&1 &&
+              [[ "$(jq -r '(.Nodes // []) | length' "$V2NODE_CONFIG_DIR/config.json" 2>/dev/null)" == "1" ]]; then
+            api_host="${api_host:-$(jq -er '.Nodes[0].ApiHost' "$V2NODE_CONFIG_DIR/config.json")}"
+            node_id="${node_id:-$(jq -er '.Nodes[0].NodeID' "$V2NODE_CONFIG_DIR/config.json")}"
+        fi
+    fi
+    [[ -n "$api_host" && -n "$node_id" ]] ||
+        die "--api-host and --node-id are required when managing multiple nodes"
+    api_host=$(normalize_api_host "$api_host")
+    node_key=$(printf '%s:%s' "$api_host" "$node_id" | sha256sum | awk '{print substr($1,1,16)}')
+    [[ "$node_key" =~ ^[a-f0-9]{16}$ ]] || die "could not derive the node instance key"
+    NEXTV1_DIR="$NEXTV1_NODES_DIR/$node_key"
 }
 
 parse_args() {
@@ -211,9 +274,10 @@ validate_args() {
     if [[ -n "$bootstrap_token" ]]; then
         [[ "$bootstrap_token" =~ ^[a-f0-9]{64}$ ]] || die "invalid --bootstrap-token"
     fi
+    [[ -n "$api_host" && -n "$node_id" ]] || die "panel host and node ID are required"
     if [[ ! -f "$V2NODE_CONFIG_DIR/config.json" ]]; then
-        [[ -n "$api_host" && -n "$node_id" && (-n "$api_key" || -n "$bootstrap_token") ]] ||
-            die "new v2node install requires panel host, node ID and bootstrap credentials"
+        [[ -n "$api_key" || -n "$bootstrap_token" ]] ||
+            die "new v2node install requires bootstrap credentials"
     fi
     if [[ -n "$bootstrap_token" ]]; then
         if [[ ! "$api_host" =~ ^https:// ]] &&
@@ -222,7 +286,7 @@ validate_args() {
         fi
     fi
     if [[ -f "$HAPROXY_CONFIG" ]] &&
-          ! grep -q '^# Managed by Next-V1 installer$' "$HAPROXY_CONFIG" &&
+          ! is_managed_haproxy_config &&
           grep -Eq '^[[:space:]]*(frontend|listen|backend)[[:space:]]+' "$HAPROXY_CONFIG" &&
           [[ "$replace_haproxy_config" != true ]]; then
         die "HAProxy already has routes; use a dedicated server or pass --replace-haproxy-config"
@@ -230,25 +294,36 @@ validate_args() {
 }
 
 validate_existing_v2node_config() {
-    [[ -f "$V2NODE_CONFIG_DIR/config.json" && -n "$api_host" && -n "$node_id" ]] || return 0
+    [[ -f "$V2NODE_CONFIG_DIR/config.json" ]] || return 0
     command -v jq >/dev/null || die "jq is required to validate the existing v2node config"
-    local configured_host configured_node_id
-    configured_host=$(jq -er '.Nodes[0].ApiHost | select(type == "string" and length > 0)' \
-        "$V2NODE_CONFIG_DIR/config.json") || die "existing v2node config has no valid API host"
-    configured_node_id=$(jq -er '.Nodes[0].NodeID | select(type == "number")' \
-        "$V2NODE_CONFIG_DIR/config.json") || die "existing v2node config has no valid node ID"
-    if [[ "${configured_host%/}" != "${api_host%/}" || "$configured_node_id" != "$node_id" ]]; then
-        die "existing v2node config belongs to a different panel or node"
-    fi
+    jq -e '.Nodes | type == "array" and all(.[]; (.ApiHost | type == "string" and length > 0) and (.NodeID | type == "number"))' \
+        "$V2NODE_CONFIG_DIR/config.json" >/dev/null || die "existing v2node config has an invalid Nodes array"
+    local matches
+    matches=$(jq --arg host "$api_host" --argjson id "$node_id" \
+        '[.Nodes[] | select((.ApiHost | sub("/+$"; "")) == $host and .NodeID == $id)] | length' \
+        "$V2NODE_CONFIG_DIR/config.json")
+    (( matches <= 1 )) || die "existing v2node config contains a duplicate panel node"
 }
 
 install_packages() {
-    local packages=(haproxy openssl ca-certificates jq iproute2 curl unzip)
+    local packages=(haproxy openssl ca-certificates jq iproute2 curl unzip util-linux)
     [[ "$cert_mode" == "letsencrypt" ]] && packages+=(certbot)
     info "Installing required packages"
     export DEBIAN_FRONTEND=noninteractive
-    apt-get update -y
-    apt-get install -y "${packages[@]}"
+    apt-get -o DPkg::Lock::Timeout=300 update -y
+    apt-get -o DPkg::Lock::Timeout=300 install -y "${packages[@]}"
+}
+
+ensure_install_lock_tool() {
+    command -v flock >/dev/null 2>&1 && return
+    apt-get -o DPkg::Lock::Timeout=300 update -y
+    apt-get -o DPkg::Lock::Timeout=300 install -y util-linux
+}
+
+acquire_install_lock() {
+    install -d -m 0700 "$NEXTV1_ROOT"
+    exec 9>"$NEXTV1_ROOT/install.lock"
+    flock -w 300 9 || die "another Next-V1 installation is still running"
 }
 
 release_asset_name() {
@@ -372,9 +447,91 @@ fetch_panel_api_key() {
     mv "$next_token_file" "$bootstrap_token_file"
 }
 
+validate_requested_port_conflicts() {
+    local config_path="${1:-$V2NODE_CONFIG_DIR/config.json}"
+    [[ -f "$config_path" ]] || return 0
+    local entry existing_host existing_id existing_key response protocol
+    local existing_backend existing_frontend token_dir="$NEXTV1_ROOT"
+    [[ -d "$token_dir" ]] || token_dir=$(dirname "$config_path")
+    while IFS= read -r entry; do
+        existing_host=$(normalize_api_host "$(jq -er '.ApiHost' <<<"$entry")")
+        existing_id=$(jq -er '.NodeID' <<<"$entry")
+        if [[ "$existing_host" == "$api_host" && "$existing_id" == "$node_id" ]]; then
+            continue
+        fi
+        existing_key=$(jq -er '.ApiKey | select(type == "string" and length > 0)' <<<"$entry") ||
+            die "existing node $existing_host:$existing_id has no API credential"
+        port_check_token_file=$(mktemp "$token_dir/port-check-token.XXXXXX")
+        printf '%s' "$existing_key" > "$port_check_token_file"
+        chmod 0600 "$port_check_token_file"
+        info "Checking ports used by existing node $existing_host:$existing_id"
+        if ! response=$(curl --fail --silent --show-error --retry 2 \
+              --connect-timeout 10 --max-time 30 --get \
+              --data-urlencode 'node_type=v2node' \
+              --data-urlencode "node_id=$existing_id" \
+              --data-urlencode "token@$port_check_token_file" \
+              "$existing_host/api/v2/server/config"); then
+            die "could not verify ports for existing node $existing_host:$existing_id"
+        fi
+        rm -f "$port_check_token_file"
+        port_check_token_file=""
+        protocol=$(jq -er '.protocol | select(type == "string" and length > 0)' <<<"$response") ||
+            die "existing node $existing_host:$existing_id returned an invalid protocol"
+        existing_backend=$(jq -er '(.server_port // 0) | select(type == "number")' <<<"$response") ||
+            die "existing node $existing_host:$existing_id returned an invalid backend port"
+        if [[ "$protocol" == "next-v1" && "$existing_backend" == 0 ]]; then
+            existing_backend=24443
+        fi
+        if (( existing_backend != 0 )); then
+            validate_port "$existing_backend"
+            if [[ "$backend_port" == "$existing_backend" || "$frontend_port" == "$existing_backend" ]]; then
+                die "requested ports conflict with backend $existing_backend used by $existing_host:$existing_id"
+            fi
+        fi
+        if [[ "$protocol" == "next-v1" ]]; then
+            existing_frontend=$(jq -er '(.outer_tls.frontend_port // 443) | select(type == "number")' <<<"$response") ||
+                die "existing node $existing_host:$existing_id returned an invalid HAProxy port"
+            (( existing_frontend != 0 )) || existing_frontend=443
+            validate_port "$existing_frontend"
+            if [[ "$frontend_port" == "$existing_frontend" || "$backend_port" == "$existing_frontend" ]]; then
+                die "requested ports conflict with HAProxy port $existing_frontend used by $existing_host:$existing_id"
+            fi
+        fi
+    done < <(jq -c '.Nodes[]' "$config_path")
+}
+
 prepare_directories() {
     install -d -m 0755 "$INSTALL_DIR" "$V2NODE_CONFIG_DIR"
-    install -d -m 0700 "$NEXTV1_DIR" "$NEXTV1_DIR/private"
+    install -d -m 0700 "$NEXTV1_ROOT" "$NEXTV1_NODES_DIR" "$NEXTV1_DIR" "$NEXTV1_DIR/private"
+}
+
+migrate_legacy_single_node() {
+    [[ -f "$V2NODE_CONFIG_DIR/config.json" && -s "$NEXTV1_ROOT/private/haproxy.pem" ]] || return 0
+    local legacy_host legacy_id legacy_key target file legacy_hook migrated_hook
+    legacy_host=$(jq -er '.Nodes[0].ApiHost | select(type == "string" and length > 0)' \
+        "$V2NODE_CONFIG_DIR/config.json") || return 0
+    legacy_id=$(jq -er '.Nodes[0].NodeID | select(type == "number")' \
+        "$V2NODE_CONFIG_DIR/config.json") || return 0
+    legacy_host=$(normalize_api_host "$legacy_host")
+    legacy_key=$(printf '%s:%s' "$legacy_host" "$legacy_id" | sha256sum | awk '{print substr($1,1,16)}')
+    target="$NEXTV1_NODES_DIR/$legacy_key"
+    [[ ! -e "$target/private/haproxy.pem" ]] || return 0
+    info "Migrating the existing single-node identity into $legacy_key"
+    install -d -m 0700 "$target" "$target/private"
+    for file in client-ca.crt client-ca.srl shared-client.crt server-ca.crt server-ca.srl \
+          server.crt server-fullchain.pem client.yaml; do
+        [[ -e "$NEXTV1_ROOT/$file" ]] && cp -a "$NEXTV1_ROOT/$file" "$target/$file"
+    done
+    for file in client-ca.key shared-client.key shared-client.csr client.ext server-ca.key \
+          server.key server.csr server.ext server-name haproxy-server.key haproxy.pem; do
+        [[ -e "$NEXTV1_ROOT/private/$file" ]] && cp -a "$NEXTV1_ROOT/private/$file" "$target/private/$file"
+    done
+    legacy_hook="/etc/letsencrypt/renewal-hooks/deploy/next-v1-haproxy"
+    migrated_hook="/etc/letsencrypt/renewal-hooks/deploy/next-v1-haproxy-$legacy_key"
+    if [[ -f "$legacy_hook" && ! -e "$migrated_hook" ]]; then
+        sed "s|$NEXTV1_ROOT|$target|g" "$legacy_hook" > "$migrated_hook"
+        chmod 0755 "$migrated_hook"
+    fi
 }
 
 certificate_matches_key() {
@@ -489,7 +646,7 @@ request_letsencrypt_server() {
     install -m 0600 "/etc/letsencrypt/live/$server_name/privkey.pem" \
         "$NEXTV1_DIR/private/haproxy-server.key"
 
-    local hook="/etc/letsencrypt/renewal-hooks/deploy/next-v1-haproxy"
+    local hook="/etc/letsencrypt/renewal-hooks/deploy/next-v1-haproxy-$node_key"
     cat > "$hook" <<EOF
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -518,7 +675,7 @@ install_existing_server() {
 
 prepare_server_identity() {
     if [[ "$cert_mode" != "letsencrypt" ]]; then
-        rm -f /etc/letsencrypt/renewal-hooks/deploy/next-v1-haproxy
+        rm -f "/etc/letsencrypt/renewal-hooks/deploy/next-v1-haproxy-$node_key"
     fi
     case "$cert_mode" in
         self-signed) generate_self_signed_server ;;
@@ -534,123 +691,250 @@ prepare_server_identity() {
         die "server certificate expires in less than 24 hours"
 }
 
-configure_haproxy() {
-    info "Configuring HAProxy mTLS on port $frontend_port"
-    local backup=""
-    local candidate="$HAPROXY_CONFIG.next-v1.new"
-    if [[ -f "$HAPROXY_CONFIG" ]]; then
-        if ! grep -q '^# Managed by Next-V1 installer$' "$HAPROXY_CONFIG" &&
-              grep -Eq '^[[:space:]]*(frontend|listen|backend)[[:space:]]+' "$HAPROXY_CONFIG" &&
-              [[ "$replace_haproxy_config" != true ]]; then
-            die "HAProxy already has routes; re-run with --replace-haproxy-config on a dedicated server"
-        fi
-        backup="$HAPROXY_CONFIG.next-v1.bak.$(date +%Y%m%d%H%M%S)"
-        cp -a "$HAPROXY_CONFIG" "$backup"
+authorize_haproxy_management() {
+    if [[ -f "$HAPROXY_CONFIG" ]] &&
+          ! is_managed_haproxy_config &&
+          grep -Eq '^[[:space:]]*(frontend|listen|backend)[[:space:]]+' "$HAPROXY_CONFIG" &&
+          [[ "$replace_haproxy_config" != true ]]; then
+        die "HAProxy already has routes; use a dedicated server or pass --replace-haproxy-config"
     fi
-    cat > "$candidate" <<EOF
-# Managed by Next-V1 installer
-global
-    log /dev/log local0
-    log /dev/log local1 notice
-    user haproxy
-    group haproxy
-    daemon
-    ssl-default-bind-options ssl-min-ver TLSv1.3 no-tls-tickets
-
-defaults
-    log global
-    mode tcp
-    option tcplog
-    timeout connect 5s
-    timeout client 1h
-    timeout server 1h
-
-frontend next_v1_mtls
-    bind :$frontend_port ssl crt $NEXTV1_DIR/private/haproxy.pem ca-file $NEXTV1_DIR/client-ca.crt verify required alpn next-v1
-    default_backend next_v1_backend
-
-backend next_v1_backend
-    server next_v1 $backend_host:$backend_port send-proxy-v2 check inter 3s fall 3 rise 2
-EOF
-    if ! haproxy -c -f "$candidate"; then
-        rm -f "$candidate"
-        die "new HAProxy configuration did not validate; existing configuration was not changed"
-    fi
-    chmod 0644 "$candidate"
-    mv "$candidate" "$HAPROXY_CONFIG"
-    if ! systemctl enable haproxy; then
-        if [[ -n "$backup" ]]; then
-            cp -a "$backup" "$HAPROXY_CONFIG"
-        else
-            mv "$HAPROXY_CONFIG" "$HAPROXY_CONFIG.next-v1.failed"
+    if [[ -f "$HAPROXY_CONFIG" ]] && ! is_managed_haproxy_config; then
+        if grep -Eq '^[[:space:]]*(frontend|listen|backend)[[:space:]]+' "$HAPROXY_CONFIG"; then
+            [[ "$replace_haproxy_config" == true ]] ||
+                die "HAProxy takeover requires --replace-haproxy-config"
         fi
-        die "could not enable HAProxy; the previous configuration was restored when available"
-    fi
-    if systemctl is-active --quiet haproxy; then
-        if ! systemctl reload haproxy; then
-            if [[ -n "$backup" ]]; then
-                cp -a "$backup" "$HAPROXY_CONFIG"
-                systemctl restart haproxy || true
-            else
-                mv "$HAPROXY_CONFIG" "$HAPROXY_CONFIG.next-v1.failed"
-            fi
-            die "HAProxy reload failed; the previous configuration was restored"
-        fi
+        install -m 0600 /dev/null "$NEXTV1_ROOT/manage-haproxy"
     else
-        if ! systemctl start haproxy; then
-            if [[ -n "$backup" ]]; then
-                cp -a "$backup" "$HAPROXY_CONFIG"
-                systemctl restart haproxy || true
-            else
-                mv "$HAPROXY_CONFIG" "$HAPROXY_CONFIG.next-v1.failed"
-            fi
-            die "HAProxy start failed; the previous configuration was restored when available"
-        fi
+        rm -f "$NEXTV1_ROOT/manage-haproxy"
     fi
 }
 
-install_v2node() {
-    info "Activating the verified Next-V1 v2node binary"
-    mv "$staged_binary" "$INSTALL_DIR/v2node"
-    staged_binary=""
-    local data_file
+upsert_v2node_node() {
+    local config_path="$1"
+    local candidate_path="$2"
+    local host
+    host=$(normalize_api_host "$3")
+    local id="$4"
+    local credential_path="$5"
+    jq --arg host "$host" --argjson id "$id" --rawfile key "$credential_path" '
+        def same_node: ((.ApiHost | sub("/+$"; "")) == $host and .NodeID == $id);
+        .Nodes = ((.Nodes // []) |
+            if any(.[]; same_node) then
+                map(if same_node then
+                    .ApiHost = $host | .ApiKey = $key | .Timeout = (.Timeout // 15)
+                else . end)
+            else
+                . + [{ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15}]
+            end)
+    ' "$config_path" > "$candidate_path" || return 1
+    chmod 0600 "$candidate_path"
+    mv "$candidate_path" "$config_path"
+}
+
+validate_identity_target() {
+    [[ "$node_key" =~ ^[a-f0-9]{16}$ && "$NEXTV1_DIR" == "$NEXTV1_NODES_DIR/$node_key" ]]
+}
+
+snapshot_identity_state() {
+    validate_identity_target || die "refusing to snapshot an invalid node identity path"
+    local snapshot
+    snapshot=$(mktemp -d "$NEXTV1_ROOT/identity-rollback.XXXXXX") ||
+        die "could not create the certificate rollback snapshot"
+    chmod 0700 "$snapshot" || {
+        rm -rf -- "$snapshot"
+        die "could not protect the certificate rollback snapshot"
+    }
+    if [[ -d "$NEXTV1_DIR" ]]; then
+        cp -a "$NEXTV1_DIR" "$snapshot/node" || {
+            rm -rf -- "$snapshot"
+            die "could not snapshot the current certificate identity"
+        }
+        : > "$snapshot/node.exists" || {
+            rm -rf -- "$snapshot"
+            die "could not finish the certificate rollback manifest"
+        }
+    fi
+    local hook="/etc/letsencrypt/renewal-hooks/deploy/next-v1-haproxy-$node_key"
+    if [[ -f "$hook" ]]; then
+        cp -a "$hook" "$snapshot/certbot-hook" || {
+            rm -rf -- "$snapshot"
+            die "could not snapshot the certificate renewal hook"
+        }
+        : > "$snapshot/certbot-hook.exists" || {
+            rm -rf -- "$snapshot"
+            die "could not finish the renewal-hook rollback manifest"
+        }
+    fi
+    identity_rollback_dir="$snapshot"
+}
+
+rollback_identity() {
+    [[ -n "$identity_rollback_dir" &&
+       "$identity_rollback_dir" == "$NEXTV1_ROOT"/identity-rollback.* ]] || return 1
+    validate_identity_target || return 1
+    info "Restoring the previous certificate identity for node $node_key"
+    rm -rf -- "$NEXTV1_DIR"
+    if [[ -f "$identity_rollback_dir/node.exists" ]]; then
+        install -d -m 0700 "$NEXTV1_NODES_DIR"
+        cp -a "$identity_rollback_dir/node" "$NEXTV1_DIR"
+    fi
+    local hook="/etc/letsencrypt/renewal-hooks/deploy/next-v1-haproxy-$node_key"
+    if [[ -f "$identity_rollback_dir/certbot-hook.exists" ]]; then
+        cp -a "$identity_rollback_dir/certbot-hook" "$hook"
+    else
+        rm -f "$hook"
+    fi
+}
+
+snapshot_activation_file() {
+    local snapshot="$1" path="$2" name="$3"
+    if [[ -e "$path" ]]; then
+        cp -a "$path" "$snapshot/$name" || return 1
+        : > "$snapshot/$name.exists" || return 1
+    fi
+}
+
+restore_activation_file() {
+    local path="$1" name="$2"
+    if [[ -f "$activation_rollback_dir/$name.exists" ]]; then
+        cp -a "$activation_rollback_dir/$name" "$path"
+    else
+        rm -f "$path"
+    fi
+}
+
+snapshot_activation_state() {
+    local snapshot
+    snapshot=$(mktemp -d "$NEXTV1_ROOT/activation-rollback.XXXXXX") ||
+        die "could not create the service rollback snapshot"
+    chmod 0700 "$snapshot" || {
+        rm -rf -- "$snapshot"
+        die "could not protect the service rollback snapshot"
+    }
+    if ! snapshot_activation_file "$snapshot" "$INSTALL_DIR/v2node" v2node ||
+          ! snapshot_activation_file "$snapshot" "$V2NODE_CONFIG_DIR/config.json" config.json ||
+          ! snapshot_activation_file "$snapshot" /etc/systemd/system/v2node.service v2node.service ||
+          ! snapshot_activation_file "$snapshot" "$HAPROXY_CONFIG" haproxy.cfg ||
+          ! snapshot_activation_file "$snapshot" "$INSTALL_DIR/geoip.dat" geoip.dat ||
+          ! snapshot_activation_file "$snapshot" "$INSTALL_DIR/geosite.dat" geosite.dat; then
+        rm -rf -- "$snapshot"
+        die "could not snapshot the current service state"
+    fi
+    if systemctl is-active --quiet v2node; then
+        : > "$snapshot/v2node.active" || { rm -rf -- "$snapshot"; die "could not snapshot v2node state"; }
+    fi
+    if systemctl is-enabled --quiet v2node; then
+        : > "$snapshot/v2node.enabled" || { rm -rf -- "$snapshot"; die "could not snapshot v2node enablement"; }
+    fi
+    if systemctl is-active --quiet haproxy; then
+        : > "$snapshot/haproxy.active" || { rm -rf -- "$snapshot"; die "could not snapshot HAProxy state"; }
+    fi
+    if systemctl is-enabled --quiet haproxy; then
+        : > "$snapshot/haproxy.enabled" || { rm -rf -- "$snapshot"; die "could not snapshot HAProxy enablement"; }
+    fi
+    activation_rollback_dir="$snapshot"
+}
+
+rollback_activation() {
+    [[ -n "$activation_rollback_dir" &&
+       "$activation_rollback_dir" == "$NEXTV1_ROOT"/activation-rollback.* ]] || return 1
+    info "Restoring the previous v2node and HAProxy state"
+    systemctl stop v2node >/dev/null 2>&1 || true
+    restore_activation_file "$INSTALL_DIR/v2node" v2node
+    restore_activation_file "$V2NODE_CONFIG_DIR/config.json" config.json
+    restore_activation_file /etc/systemd/system/v2node.service v2node.service
+    restore_activation_file "$HAPROXY_CONFIG" haproxy.cfg
+    rm -f "$NEXTV1_ROOT/manage-haproxy"
+    restore_activation_file "$INSTALL_DIR/geoip.dat" geoip.dat
+    restore_activation_file "$INSTALL_DIR/geosite.dat" geosite.dat
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ -f "$activation_rollback_dir/v2node.enabled" ]]; then
+        systemctl enable v2node >/dev/null 2>&1 || true
+    else
+        systemctl disable v2node >/dev/null 2>&1 || true
+    fi
+    if [[ -f "$activation_rollback_dir/v2node.active" ]]; then
+        systemctl restart v2node >/dev/null 2>&1 || true
+    else
+        systemctl stop v2node >/dev/null 2>&1 || true
+    fi
+    if [[ -f "$activation_rollback_dir/haproxy.enabled" ]]; then
+        systemctl enable haproxy >/dev/null 2>&1 || true
+    else
+        systemctl disable haproxy >/dev/null 2>&1 || true
+    fi
+    if [[ -f "$activation_rollback_dir/haproxy.active" ]]; then
+        systemctl reload-or-restart haproxy >/dev/null 2>&1 || true
+    else
+        systemctl stop haproxy >/dev/null 2>&1 || true
+    fi
+}
+
+commit_installation_transaction() {
+    [[ -n "$activation_rollback_dir" &&
+       "$activation_rollback_dir" == "$NEXTV1_ROOT"/activation-rollback.* ]] || return 1
+    [[ -n "$identity_rollback_dir" &&
+       "$identity_rollback_dir" == "$NEXTV1_ROOT"/identity-rollback.* ]] || return 1
+    local activation_snapshot="$activation_rollback_dir"
+    local identity_snapshot="$identity_rollback_dir"
+    activation_rollback_dir=""
+    identity_rollback_dir=""
+    rm -rf -- "$activation_snapshot" "$identity_snapshot"
+}
+
+activate_v2node_files() {
+    local updated_config="$1" unit_candidate="$2" data_file
+    mv "$staged_binary" "$INSTALL_DIR/v2node" || return 1
     for data_file in geoip.dat geosite.dat; do
         if [[ -f "$INSTALL_DIR/$data_file.next-v1.new" ]]; then
-            mv "$INSTALL_DIR/$data_file.next-v1.new" "$INSTALL_DIR/$data_file"
+            mv "$INSTALL_DIR/$data_file.next-v1.new" "$INSTALL_DIR/$data_file" || return 1
         fi
     done
-    [[ -x "$INSTALL_DIR/v2node" ]] || die "v2node binary was not installed"
+    mv "$updated_config" "$V2NODE_CONFIG_DIR/config.json" || return 1
+    mv "$unit_candidate" /etc/systemd/system/v2node.service || return 1
+    systemctl daemon-reload || return 1
+    systemctl enable v2node || return 1
+    systemctl restart v2node || return 1
+}
 
-    if [[ -f "$V2NODE_CONFIG_DIR/config.json" ]]; then
-        if [[ -n "$api_key_file" ]]; then
-            local updated_config="$V2NODE_CONFIG_DIR/config.json.next-v1.new"
-            jq --rawfile key "$api_key_file" '.Nodes[0].ApiKey = $key' \
-                "$V2NODE_CONFIG_DIR/config.json" > "$updated_config" ||
-                die "could not update the existing v2node credential"
-            chmod 0600 "$updated_config"
-            mv "$updated_config" "$V2NODE_CONFIG_DIR/config.json"
-        fi
-    else
-        [[ -n "$api_host" && -n "$node_id" && (-n "$api_key" || -n "$api_key_file") ]] ||
-            die "new v2node install requires --api-host, --node-id and --api-key"
-        umask 077
-        if [[ -n "$api_key_file" ]]; then
-            jq -n --arg host "$api_host" --argjson id "$node_id" --rawfile key "$api_key_file" \
-                '{Log:{Level:"warning",Output:"",Access:"none"},Nodes:[{ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15}]}' \
-                > "$V2NODE_CONFIG_DIR/config.json"
-        else
-            jq -n --arg host "$api_host" --argjson id "$node_id" --arg key "$api_key" \
-                '{Log:{Level:"warning",Output:"",Access:"none"},Nodes:[{ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15}]}' \
-                > "$V2NODE_CONFIG_DIR/config.json"
-        fi
-        chmod 0600 "$V2NODE_CONFIG_DIR/config.json"
+install_v2node() {
+    local updated_config="$V2NODE_CONFIG_DIR/config.json.next-v1.new"
+    local upsert_candidate="$V2NODE_CONFIG_DIR/config.json.next-v1.upsert"
+    local unit_candidate=/etc/systemd/system/v2node.service.next-v1.new
+
+    local credential_file="$api_key_file"
+    local manual_credential_file=""
+    if [[ -z "$credential_file" && -n "$api_key" ]]; then
+        manual_credential_file="$NEXTV1_DIR/private/panel-api-key.manual.tmp"
+        printf '%s' "$api_key" > "$manual_credential_file"
+        chmod 0600 "$manual_credential_file"
+        credential_file="$manual_credential_file"
     fi
+    if [[ -f "$V2NODE_CONFIG_DIR/config.json" ]]; then
+        cp -a "$V2NODE_CONFIG_DIR/config.json" "$updated_config"
+    else
+        jq -n '{Log:{Level:"warning",Output:"",Access:"none"},Nodes:[]}' \
+            > "$updated_config"
+        chmod 0600 "$updated_config"
+    fi
+    local node_exists
+    node_exists=$(jq --arg host "$api_host" --argjson id "$node_id" \
+        '[.Nodes[] | select((.ApiHost | sub("/+$"; "")) == $host and .NodeID == $id)] | length' \
+        "$updated_config")
+    if [[ -z "$credential_file" ]]; then
+        (( node_exists == 1 )) || die "adding a panel node requires bootstrap credentials"
+    else
+        upsert_v2node_node "$updated_config" "$upsert_candidate" \
+            "$api_host" "$node_id" "$credential_file" ||
+            die "could not add or update the v2node panel node"
+    fi
+    [[ -n "$manual_credential_file" ]] && rm -f "$manual_credential_file"
     if [[ -n "$api_key_file" ]]; then
         rm -f "$api_key_file"
         api_key_file=""
     fi
 
-    cat > /etc/systemd/system/v2node.service <<EOF
+    cat > "$unit_candidate" <<EOF
 [Unit]
 Description=v2node Next-V1 service
 After=network-online.target
@@ -670,9 +954,14 @@ NoNewPrivileges=true
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable v2node
-    systemctl restart v2node
+    chmod 0644 "$unit_candidate"
+
+    snapshot_activation_state
+    info "Activating the verified Next-V1 v2node binary and multi-node config"
+    if ! activate_v2node_files "$updated_config" "$unit_candidate"; then
+        die "could not activate v2node; automatic rollback will run, then inspect both services"
+    fi
+    staged_binary=""
     local attempt
     for attempt in $(seq 1 15); do
         if systemctl is-active --quiet v2node &&
@@ -682,7 +971,7 @@ EOF
         sleep 1
     done
     journalctl -u v2node -n 30 --no-pager >&2 || true
-    die "v2node did not become active on 127.0.0.1:$backend_port"
+    die "v2node did not become active on 127.0.0.1:$backend_port; automatic rollback will run, then inspect both services"
 }
 
 publish_client_bundle() {
@@ -781,18 +1070,25 @@ EOF
 
 main() {
     parse_args "$@"
+    initialize_node_context
     validate_args
-    validate_existing_v2node_config
+    ensure_install_lock_tool
+    acquire_install_lock
     install_packages
+    validate_existing_v2node_config
+    validate_requested_port_conflicts
+    snapshot_identity_state
     prepare_directories
+    migrate_legacy_single_node
     fetch_panel_api_key
     stage_v2node
     generate_client_identity
     prepare_server_identity
-    configure_haproxy
+    authorize_haproxy_management
     install_v2node
     write_client_bundle
     publish_client_bundle
+    commit_installation_transaction
     print_summary
 }
 

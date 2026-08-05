@@ -23,6 +23,7 @@ const (
 
 type NodeInfo struct {
 	Id           int
+	APIHost      string
 	Type         string
 	Security     int
 	PushInterval time.Duration
@@ -35,6 +36,7 @@ type CommonNode struct {
 	Protocol   string      `json:"protocol"`
 	ListenIP   string      `json:"listen_ip"`
 	ServerPort int         `json:"server_port"`
+	OuterTLS   OuterTLS    `json:"outer_tls"`
 	Routes     []Route     `json:"routes"`
 	BaseConfig *BaseConfig `json:"base_config"`
 	//vless vmess trojan
@@ -62,6 +64,12 @@ type CommonNode struct {
 	Obfs                    string `json:"obfs"`
 	ObfsPassword            string `json:"obfs_password"`
 	Ignore_Client_Bandwidth bool   `json:"ignore_client_bandwidth"`
+}
+
+// OuterTLS describes the HAProxy listener in front of a Next-V1 inbound.
+// The v2node inbound itself continues to listen on CommonNode.ServerPort.
+type OuterTLS struct {
+	FrontendPort int `json:"frontend_port"`
 }
 
 // PaddingScheme is a string list for AnyTLS. Early Next-V1 panel builds used
@@ -176,7 +184,8 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 		return nil, fmt.Errorf("received nil response")
 	}
 	node = &NodeInfo{
-		Id: c.NodeId,
+		Id:      c.NodeId,
+		APIHost: NormalizeAPIHost(c.APIHost),
 	}
 	// parse protocol params
 	cm := &CommonNode{}
@@ -230,6 +239,13 @@ func (c *Client) GetNodeInfo(ctx context.Context) (node *NodeInfo, err error) {
 	node.Common = cm
 
 	return node, nil
+}
+
+// NormalizeAPIHost returns the canonical panel identifier used for stable
+// per-node filesystem paths. It deliberately does not otherwise rewrite the
+// URL, so the installer can produce the same value without a URL parser.
+func NormalizeAPIHost(apiHost string) string {
+	return strings.TrimRight(strings.TrimSpace(apiHost), "/")
 }
 
 func intervalToTime(i interface{}) time.Duration {

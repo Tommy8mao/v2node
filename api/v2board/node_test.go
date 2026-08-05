@@ -31,3 +31,9 @@ func TestPaddingSchemeRejectsUnknownObject(t *testing.T) {
 		t.Fatal("expected invalid padding object to fail")
 	}
 }
+
+func TestNormalizeAPIHost(t *testing.T) {
+	if got := NormalizeAPIHost("  https://panel.example///  "); got != "https://panel.example" {
+		t.Fatalf("NormalizeAPIHost() = %q", got)
+	}
+}
