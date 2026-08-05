@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - master
+      - main
     paths:
       - "**/*.go"
       - "go.mod"
       - "go.sum"
+      - "script/install-next-v1.sh"
       - ".github/workflows/release.yml"
   pull_request:
     types: [opened, synchronize, reopened]
@@ -19,6 +20,9 @@ on:
       - ".github/workflows/release.yml"
   release:
     types: [published]
+
+permissions:
+  contents: read
 
 jobs:
 
@@ -137,6 +141,9 @@ jobs:
         run: |
           cp ${GITHUB_WORKSPACE}/README.md ./build_assets/README.md
           cp ${GITHUB_WORKSPACE}/LICENSE ./build_assets/LICENSE
+          cp ${GITHUB_WORKSPACE}/script/install-next-v1.sh ./build_assets/install-next-v1.sh
+          cp ${GITHUB_WORKSPACE}/docs/next-v1-deployment.md ./build_assets/next-v1-deployment.md
+          cp ${GITHUB_WORKSPACE}/docs/next-v1-protocol.md ./build_assets/next-v1-protocol.md
           LIST=('geoip' 'geosite')
           for i in "${LIST[@]}"
           do
@@ -153,6 +160,7 @@ jobs:
           zip -9vr ../v2node-$ASSET_NAME.zip .
           popd || exit 1
           FILE=./v2node-$ASSET_NAME.zip
+          sha256sum "$FILE" > "$FILE.sha256"
           DGST=$FILE.dgst
           for METHOD in {"md5","sha1","sha256","sha512"}
           do
@@ -167,11 +175,23 @@ jobs:
           name: v2node-${{ steps.get_filename.outputs.ASSET_NAME }}
           path: |
             ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}/*
-      - name: Upload binaries to release
-        uses: svenstaro/upload-release-action@v2
-        if: github.event_name == 'release'
+            ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
+
+  publish:
+    if: github.event_name == 'release'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v7
         with:
-          repo_token: ${{ secrets.GITHUB_TOKEN }}
-          file: ./v2node-${{ steps.get_filename.outputs.ASSET_NAME }}.zip*
-          tag: ${{ github.ref }}
-          file_glob: true
+          path: release-assets
+          merge-multiple: true
+      - name: Upload verified archives to the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          find release-assets -maxdepth 1 -type f -name 'v2node-*.zip*' -print0 |
+            xargs -0 gh release upload "$GITHUB_REF_NAME" --clobber

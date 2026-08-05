@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 
 set -Eeuo pipefail
+umask 077
 
 readonly PROGRAM="${0##*/}"
 readonly INSTALL_DIR="/usr/local/v2node"
 readonly V2NODE_CONFIG_DIR="/etc/v2node"
 readonly NEXTV1_DIR="/etc/next-v1"
 readonly HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
+readonly DEFAULT_RELEASE_REPOSITORY="Tommy8mao/v2node"
+readonly DEFAULT_RELEASE_VERSION="v0.4.4-next-v1.1"
 
 frontend_port=443
 backend_host="127.0.0.1"
@@ -17,11 +20,28 @@ letsencrypt_email=""
 existing_server_cert=""
 existing_server_key=""
 binary_path=""
+release_repository="${NEXT_V1_RELEASE_REPOSITORY:-$DEFAULT_RELEASE_REPOSITORY}"
+release_version="${NEXT_V1_VERSION:-$DEFAULT_RELEASE_VERSION}"
+archive_sha256_amd64="${NEXT_V1_SHA256_AMD64:-}"
+archive_sha256_arm64="${NEXT_V1_SHA256_ARM64:-}"
 api_host=""
 node_id=""
 api_key="${V2NODE_API_KEY:-}"
+api_key_file=""
+bootstrap_token=""
+bootstrap_token_file=""
+staged_binary=""
 rotate_client=false
 replace_haproxy_config=false
+bootstrap_published=false
+
+cleanup_runtime_files() {
+    [[ -n "$api_key_file" ]] && rm -f "$api_key_file" "$api_key_file.next"
+    [[ -n "$bootstrap_token_file" ]] && rm -f "$bootstrap_token_file" "$bootstrap_token_file.next"
+    [[ -n "$staged_binary" ]] && rm -f "$staged_binary"
+    rm -f "$INSTALL_DIR/geoip.dat.next-v1.new" "$INSTALL_DIR/geosite.dat.next-v1.new"
+}
+trap cleanup_runtime_files EXIT
 
 usage() {
     cat <<'EOF'
@@ -43,10 +63,15 @@ TLS options:
 Service options:
   --frontend-port PORT          HAProxy public port (default: 443)
   --backend-port PORT           Loopback v2node port (default: 24443)
-  --binary FILE                 Install this Next-V1 v2node binary
+  --binary FILE                 Install this v2node binary instead of downloading
+  --release-repository REPO     GitHub release repository (default: Tommy8mao/v2node)
+  --version TAG                 Install a release tag instead of latest
+  --archive-sha256-amd64 HASH   Pin the Linux amd64 release archive
+  --archive-sha256-arm64 HASH   Pin the Linux arm64 release archive
   --api-host URL                Panel URL for a new v2node config
   --node-id ID                  Panel node ID for a new v2node config
   --api-key KEY                 Panel API key (or set V2NODE_API_KEY)
+  --bootstrap-token-stdin       Read the one-time node token from standard input
   -h, --help                    Show this help
 
 The three panel options are only required when /etc/v2node/config.json does not
@@ -77,6 +102,20 @@ validate_server_name() {
     [[ "$1" != .* && "$1" != *. && "$1" != *..* ]] || die "invalid server name: $1"
 }
 
+server_subject_alt_name() {
+    local value="$1" octet
+    if [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local -a octets
+        IFS=. read -r -a octets <<<"$value"
+        for octet in "${octets[@]}"; do
+            ((10#$octet <= 255)) || die "invalid IPv4 server name: $value"
+        done
+        printf 'IP:%s\n' "$value"
+    else
+        printf 'DNS:%s\n' "$value"
+    fi
+}
+
 parse_args() {
     while (($#)); do
         case "$1" in
@@ -98,12 +137,23 @@ parse_args() {
                 require_value "$@"; backend_port="$2"; shift 2 ;;
             --binary)
                 require_value "$@"; binary_path="$2"; shift 2 ;;
+            --release-repository)
+                require_value "$@"; release_repository="$2"; shift 2 ;;
+            --version)
+                require_value "$@"; release_version="$2"; shift 2 ;;
+            --archive-sha256-amd64)
+                require_value "$@"; archive_sha256_amd64="${2,,}"; shift 2 ;;
+            --archive-sha256-arm64)
+                require_value "$@"; archive_sha256_arm64="${2,,}"; shift 2 ;;
             --api-host)
                 require_value "$@"; api_host="$2"; shift 2 ;;
             --node-id)
                 require_value "$@"; node_id="$2"; shift 2 ;;
             --api-key)
                 require_value "$@"; api_key="$2"; shift 2 ;;
+            --bootstrap-token-stdin)
+                IFS= read -r bootstrap_token || die "could not read bootstrap token from stdin"
+                shift ;;
             --rotate-client)
                 rotate_client=true; shift ;;
             --replace-haproxy-config)
@@ -129,6 +179,13 @@ validate_args() {
     validate_port "$frontend_port"
     validate_port "$backend_port"
     validate_server_name "$server_name"
+    [[ "$release_repository" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] ||
+        die "invalid GitHub --release-repository"
+    [[ "$release_version" =~ ^[A-Za-z0-9._+-]+$ ]] || die "invalid --version"
+    [[ -z "$archive_sha256_amd64" || "$archive_sha256_amd64" =~ ^[a-f0-9]{64}$ ]] ||
+        die "invalid --archive-sha256-amd64"
+    [[ -z "$archive_sha256_arm64" || "$archive_sha256_arm64" =~ ^[a-f0-9]{64}$ ]] ||
+        die "invalid --archive-sha256-arm64"
     [[ "$frontend_port" != "$backend_port" ]] || die "frontend and backend ports must differ"
 
     case "$cert_mode" in
@@ -151,9 +208,18 @@ validate_args() {
     if [[ -n "$node_id" ]]; then
         [[ "$node_id" =~ ^[0-9]+$ && "$node_id" != 0 ]] || die "invalid --node-id"
     fi
-    if [[ (-n "$binary_path" || -x "$INSTALL_DIR/v2node") && ! -f "$V2NODE_CONFIG_DIR/config.json" ]]; then
-        [[ -n "$api_host" && -n "$node_id" && -n "$api_key" ]] ||
-            die "new v2node install requires --api-host, --node-id and --api-key"
+    if [[ -n "$bootstrap_token" ]]; then
+        [[ "$bootstrap_token" =~ ^[a-f0-9]{64}$ ]] || die "invalid --bootstrap-token"
+    fi
+    if [[ ! -f "$V2NODE_CONFIG_DIR/config.json" ]]; then
+        [[ -n "$api_host" && -n "$node_id" && (-n "$api_key" || -n "$bootstrap_token") ]] ||
+            die "new v2node install requires panel host, node ID and bootstrap credentials"
+    fi
+    if [[ -n "$bootstrap_token" ]]; then
+        if [[ ! "$api_host" =~ ^https:// ]] &&
+              [[ ! "$api_host" =~ ^http://(127\.0\.0\.1|localhost)(:[0-9]{1,5})?(/|$) ]]; then
+            die "--api-host must use HTTPS when bootstrap credentials are uploaded"
+        fi
     fi
     if [[ -f "$HAPROXY_CONFIG" ]] &&
           ! grep -q '^# Managed by Next-V1 installer$' "$HAPROXY_CONFIG" &&
@@ -163,13 +229,147 @@ validate_args() {
     fi
 }
 
+validate_existing_v2node_config() {
+    [[ -f "$V2NODE_CONFIG_DIR/config.json" && -n "$api_host" && -n "$node_id" ]] || return
+    command -v jq >/dev/null || die "jq is required to validate the existing v2node config"
+    local configured_host configured_node_id
+    configured_host=$(jq -er '.Nodes[0].ApiHost | select(type == "string" and length > 0)' \
+        "$V2NODE_CONFIG_DIR/config.json") || die "existing v2node config has no valid API host"
+    configured_node_id=$(jq -er '.Nodes[0].NodeID | select(type == "number")' \
+        "$V2NODE_CONFIG_DIR/config.json") || die "existing v2node config has no valid node ID"
+    if [[ "${configured_host%/}" != "${api_host%/}" || "$configured_node_id" != "$node_id" ]]; then
+        die "existing v2node config belongs to a different panel or node"
+    fi
+}
+
 install_packages() {
-    local packages=(haproxy openssl ca-certificates jq iproute2)
+    local packages=(haproxy openssl ca-certificates jq iproute2 curl unzip)
     [[ "$cert_mode" == "letsencrypt" ]] && packages+=(certbot)
     info "Installing required packages"
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y
     apt-get install -y "${packages[@]}"
+}
+
+release_asset_name() {
+    case "$(uname -m)" in
+        x86_64|amd64) printf '%s\n' 'v2node-linux-64.zip' ;;
+        aarch64|arm64) printf '%s\n' 'v2node-linux-arm64-v8a.zip' ;;
+        *) die "unsupported CPU architecture: $(uname -m)" ;;
+    esac
+}
+
+download_v2node() {
+    local asset version_path url checksum_url download_dir archive checksum extracted expected pinned actual
+    asset=$(release_asset_name)
+    case "$asset" in
+        v2node-linux-64.zip) pinned="$archive_sha256_amd64" ;;
+        v2node-linux-arm64-v8a.zip) pinned="$archive_sha256_arm64" ;;
+        *) die "no checksum slot for release asset $asset" ;;
+    esac
+    if [[ "$release_version" == "latest" ]]; then
+        version_path="latest/download"
+    else
+        version_path="download/$release_version"
+    fi
+    url="https://github.com/$release_repository/releases/$version_path/$asset"
+    checksum_url="$url.sha256"
+    download_dir=$(mktemp -d "${TMPDIR:-/tmp}/next-v1-download.XXXXXX")
+    archive="$download_dir/$asset"
+    checksum="$archive.sha256"
+    extracted="$download_dir/extracted"
+    mkdir -p "$extracted"
+    info "Downloading v2node from $release_repository ($release_version)"
+    if ! curl --fail --location --silent --show-error --retry 3 \
+          --connect-timeout 15 "$url" -o "$archive"; then
+        rm -rf "$download_dir"
+        die "download failed: $url"
+    fi
+    if ! curl --fail --location --silent --show-error --retry 3 \
+          --connect-timeout 15 "$checksum_url" -o "$checksum"; then
+        rm -rf "$download_dir"
+        die "checksum download failed: $checksum_url"
+    fi
+    expected=$(awk 'NF {print $1; exit}' "$checksum")
+    if [[ ! "$expected" =~ ^[a-fA-F0-9]{64}$ ]] ||
+          ! printf '%s  %s\n' "$expected" "$archive" | sha256sum -c - >/dev/null; then
+        rm -rf "$download_dir"
+        die "v2node release SHA-256 verification failed"
+    fi
+    actual=$(sha256sum "$archive" | awk '{print $1}')
+    if [[ -n "$pinned" && "$actual" != "$pinned" ]]; then
+        rm -rf "$download_dir"
+        die "v2node release does not match the panel-pinned SHA-256"
+    fi
+    if ! unzip -p "$archive" v2node > "$extracted/v2node"; then
+        rm -rf "$download_dir"
+        die "invalid v2node release archive: $asset"
+    fi
+    if [[ ! -f "$extracted/v2node" ]]; then
+        rm -rf "$download_dir"
+        die "release archive does not contain v2node"
+    fi
+    staged_binary="$INSTALL_DIR/v2node.next-v1.new"
+    install -m 0755 "$extracted/v2node" "$staged_binary"
+    local data_file
+    for data_file in geoip.dat geosite.dat; do
+        if unzip -Z1 "$archive" "$data_file" >/dev/null 2>&1; then
+            unzip -p "$archive" "$data_file" > "$extracted/$data_file"
+            install -m 0644 "$extracted/$data_file" "$INSTALL_DIR/$data_file.next-v1.new"
+        fi
+    done
+    rm -rf "$download_dir"
+}
+
+stage_v2node() {
+    if [[ -n "$binary_path" ]]; then
+        info "Staging the supplied Next-V1 v2node binary"
+        staged_binary="$INSTALL_DIR/v2node.next-v1.new"
+        install -m 0755 "$binary_path" "$staged_binary"
+    else
+        download_v2node
+    fi
+    [[ -x "$staged_binary" ]] || die "v2node binary was not staged"
+}
+
+fetch_panel_api_key() {
+    local endpoint payload_dir payload response next_token_file
+    [[ -n "$api_key" || -z "$bootstrap_token" ]] && return
+    [[ -n "$bootstrap_token" ]] || die "no panel API key or bootstrap token is available"
+    endpoint="${api_host%/}/api/v2/server/next-v1/bootstrap/config"
+    payload_dir=$(mktemp -d "${TMPDIR:-/tmp}/next-v1-bootstrap-config.XXXXXX")
+    payload="$payload_dir/payload.json"
+    bootstrap_token_file="$NEXTV1_DIR/private/bootstrap-token.tmp"
+    printf '%s' "$bootstrap_token" > "$bootstrap_token_file"
+    chmod 0600 "$bootstrap_token_file"
+    bootstrap_token=""
+    chmod 0700 "$payload_dir"
+    jq -n --argjson node_id "$node_id" --rawfile bootstrap_token "$bootstrap_token_file" \
+        '{node_id:$node_id,bootstrap_token:$bootstrap_token}' > "$payload"
+    chmod 0600 "$payload"
+    info "Fetching the authenticated v2node configuration credential"
+    if ! response=$(curl --fail --silent --show-error --retry 3 \
+          --connect-timeout 15 -H 'Content-Type: application/json' \
+          --data-binary "@$payload" "$endpoint"); then
+        rm -rf "$payload_dir"
+        die "panel bootstrap configuration request failed"
+    fi
+    rm -rf "$payload_dir"
+    api_key_file="$NEXTV1_DIR/private/panel-api-key.tmp"
+    if ! jq -jer '.data.api_key | select(type == "string" and length > 0)' \
+          <<<"$response" > "$api_key_file"; then
+        rm -f "$api_key_file"
+        die "panel returned an invalid v2node credential"
+    fi
+    chmod 0600 "$api_key_file"
+    next_token_file="$bootstrap_token_file.next"
+    if ! jq -jer '.data.bootstrap_token | select(type == "string" and test("^[a-f0-9]{64}$"))' \
+          <<<"$response" > "$next_token_file"; then
+        rm -f "$api_key_file" "$bootstrap_token_file" "$next_token_file"
+        die "panel returned an invalid completion token"
+    fi
+    chmod 0600 "$next_token_file"
+    mv "$next_token_file" "$bootstrap_token_file"
 }
 
 prepare_directories() {
@@ -241,7 +441,7 @@ generate_self_signed_server() {
     local server_cert="$NEXTV1_DIR/server.crt"
     local server_ext="$NEXTV1_DIR/private/server.ext"
     local fullchain="$NEXTV1_DIR/server-fullchain.pem"
-    local identity_name="$NEXTV1_DIR/private/server-name"
+    local identity_name="$NEXTV1_DIR/private/server-name" subject_alt_name
 
     if [[ -s "$server_key" && -s "$server_cert" && -s "$ca_cert" &&
           -s "$fullchain" && -s "$identity_name" &&
@@ -253,6 +453,7 @@ generate_self_signed_server() {
     fi
 
     info "Generating self-signed server certificate for $server_name"
+    subject_alt_name=$(server_subject_alt_name "$server_name")
     umask 077
     openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$ca_key"
     openssl req -x509 -new -sha256 -days 3650 -key "$ca_key" \
@@ -265,7 +466,7 @@ generate_self_signed_server() {
     printf '%s\n' 'basicConstraints=critical,CA:FALSE' \
         'keyUsage=critical,digitalSignature,keyEncipherment' \
         'extendedKeyUsage=serverAuth' \
-        "subjectAltName=DNS:$server_name" > "$server_ext"
+        "subjectAltName=$subject_alt_name" > "$server_ext"
     openssl x509 -req -sha256 -days 825 -in "$server_csr" \
         -CA "$ca_cert" -CAkey "$ca_key" -CAcreateserial \
         -extfile "$server_ext" -out "$server_cert"
@@ -409,23 +610,44 @@ EOF
 }
 
 install_v2node() {
-    if [[ -n "$binary_path" ]]; then
-        info "Installing Next-V1 v2node binary"
-        install -m 0755 "$binary_path" "$INSTALL_DIR/v2node"
-    fi
-    if [[ ! -x "$INSTALL_DIR/v2node" ]]; then
-        info "No v2node binary installed; HAProxy/certificates will still be configured"
-        return
-    fi
+    info "Activating the verified Next-V1 v2node binary"
+    mv "$staged_binary" "$INSTALL_DIR/v2node"
+    staged_binary=""
+    local data_file
+    for data_file in geoip.dat geosite.dat; do
+        if [[ -f "$INSTALL_DIR/$data_file.next-v1.new" ]]; then
+            mv "$INSTALL_DIR/$data_file.next-v1.new" "$INSTALL_DIR/$data_file"
+        fi
+    done
+    [[ -x "$INSTALL_DIR/v2node" ]] || die "v2node binary was not installed"
 
-    if [[ ! -f "$V2NODE_CONFIG_DIR/config.json" ]]; then
-        [[ -n "$api_host" && -n "$node_id" && -n "$api_key" ]] ||
+    if [[ -f "$V2NODE_CONFIG_DIR/config.json" ]]; then
+        if [[ -n "$api_key_file" ]]; then
+            local updated_config="$V2NODE_CONFIG_DIR/config.json.next-v1.new"
+            jq --rawfile key "$api_key_file" '.Nodes[0].ApiKey = $key' \
+                "$V2NODE_CONFIG_DIR/config.json" > "$updated_config" ||
+                die "could not update the existing v2node credential"
+            chmod 0600 "$updated_config"
+            mv "$updated_config" "$V2NODE_CONFIG_DIR/config.json"
+        fi
+    else
+        [[ -n "$api_host" && -n "$node_id" && (-n "$api_key" || -n "$api_key_file") ]] ||
             die "new v2node install requires --api-host, --node-id and --api-key"
         umask 077
-        jq -n --arg host "$api_host" --argjson id "$node_id" --arg key "$api_key" \
-            '{Log:{Level:"warning",Output:"",Access:"none"},Nodes:[{ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15}]}' \
-            > "$V2NODE_CONFIG_DIR/config.json"
+        if [[ -n "$api_key_file" ]]; then
+            jq -n --arg host "$api_host" --argjson id "$node_id" --rawfile key "$api_key_file" \
+                '{Log:{Level:"warning",Output:"",Access:"none"},Nodes:[{ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15}]}' \
+                > "$V2NODE_CONFIG_DIR/config.json"
+        else
+            jq -n --arg host "$api_host" --argjson id "$node_id" --arg key "$api_key" \
+                '{Log:{Level:"warning",Output:"",Access:"none"},Nodes:[{ApiHost:$host,NodeID:$id,ApiKey:$key,Timeout:15}]}' \
+                > "$V2NODE_CONFIG_DIR/config.json"
+        fi
         chmod 0600 "$V2NODE_CONFIG_DIR/config.json"
+    fi
+    if [[ -n "$api_key_file" ]]; then
+        rm -f "$api_key_file"
+        api_key_file=""
     fi
 
     cat > /etc/systemd/system/v2node.service <<EOF
@@ -449,7 +671,8 @@ NoNewPrivileges=true
 WantedBy=multi-user.target
 EOF
     systemctl daemon-reload
-    systemctl enable --now v2node
+    systemctl enable v2node
+    systemctl restart v2node
     local attempt
     for attempt in $(seq 1 15); do
         if systemctl is-active --quiet v2node &&
@@ -460,6 +683,51 @@ EOF
     done
     journalctl -u v2node -n 30 --no-pager >&2 || true
     die "v2node did not become active on 127.0.0.1:$backend_port"
+}
+
+publish_client_bundle() {
+    local endpoint payload_dir payload server_ca_file fingerprint response
+    [[ -n "$api_host" && -n "$node_id" && -s "$bootstrap_token_file" ]] || return
+    endpoint="${api_host%/}/api/v2/server/next-v1/bootstrap"
+    payload_dir=$(mktemp -d "${TMPDIR:-/tmp}/next-v1-bootstrap.XXXXXX")
+    payload="$payload_dir/payload.json"
+    server_ca_file="$payload_dir/server-ca.crt"
+    if [[ "$cert_mode" == "self-signed" ]]; then
+        cp "$NEXTV1_DIR/server-ca.crt" "$server_ca_file"
+        fingerprint=$(openssl x509 -in "$NEXTV1_DIR/server-fullchain.pem" -outform DER |
+            openssl dgst -sha256 -hex | awk '{print $2}')
+    else
+        : > "$server_ca_file"
+        fingerprint=""
+    fi
+    chmod 0700 "$payload_dir"
+    jq -n \
+        --argjson node_id "$node_id" \
+        --rawfile bootstrap_token "$bootstrap_token_file" \
+        --arg server_name "$server_name" \
+        --arg fingerprint "$fingerprint" \
+        --argjson alpn '["next-v1"]' \
+        --rawfile certificate "$NEXTV1_DIR/shared-client.crt" \
+        --rawfile private_key "$NEXTV1_DIR/private/shared-client.key" \
+        --rawfile ca_certificate "$server_ca_file" \
+        '{node_id:$node_id,bootstrap_token:$bootstrap_token,server_name:$server_name,
+          fingerprint:$fingerprint,alpn:$alpn,client_certificate:$certificate,
+          client_private_key:$private_key,ca_certificate:$ca_certificate}' > "$payload"
+    chmod 0600 "$payload"
+    info "Publishing the generated mTLS client identity to the panel"
+    if ! response=$(curl --fail --silent --show-error --retry 3 \
+          --connect-timeout 15 -H 'Content-Type: application/json' \
+          --data-binary "@$payload" "$endpoint"); then
+        rm -rf "$payload_dir"
+        die "panel bootstrap request failed: $endpoint"
+    fi
+    rm -rf "$payload_dir"
+    if ! jq -e '.data == true' >/dev/null 2>&1 <<<"$response"; then
+        die "panel rejected the Next-V1 bootstrap identity"
+    fi
+    rm -f "$bootstrap_token_file"
+    bootstrap_token_file=""
+    bootstrap_published=true
 }
 
 write_client_bundle() {
@@ -502,22 +770,29 @@ Next-V1 outer mTLS is ready.
   Server SHA-256 pin:   $fingerprint
   Client bundle:        $NEXTV1_DIR/client.yaml (secret, mode 0600)
 
-Set the panel node backend port to $backend_port. Copy the client certificate,
-private key and TLS fields from client.yaml into the panel's shared Next-V1
-subscription settings. Do not publish that file or the private client CA.
 EOF
+    if [[ "$bootstrap_published" == true ]]; then
+        printf '%s\n' 'The generated client identity was sent back to the authenticated panel node.'
+    else
+        printf '%s\n' 'Copy the client.yaml TLS fields to the panel before enabling this node.'
+    fi
+    printf '%s\n' 'Keep client.yaml secret; it is a local recovery copy and must not be published.'
 }
 
 main() {
     parse_args "$@"
     validate_args
+    validate_existing_v2node_config
     install_packages
     prepare_directories
+    fetch_panel_api_key
+    stage_v2node
     generate_client_identity
     prepare_server_identity
     configure_haproxy
     install_v2node
     write_client_bundle
+    publish_client_bundle
     print_summary
 }
 

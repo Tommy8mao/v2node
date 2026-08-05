@@ -4,6 +4,7 @@ set -Eeuo pipefail
 
 readonly REPO_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 readonly MIHOMO_DIR="${MIHOMO_DIR:-/Users/maoxinyu/Library/Mobile Documents/com~apple~CloudDocs/Xcode/Nextin/mihomo-Meta-changed}"
+readonly MIHOMO_BIN="${MIHOMO_BIN:-}"
 readonly PASSWORD="next-v1-e2e-user"
 readonly PORT_BASE="${NEXTV1_E2E_PORT_BASE:-$((20000 + (RANDOM * 32768 + RANDOM) % 20000))}"
 readonly PANEL_PORT=$PORT_BASE
@@ -13,7 +14,7 @@ readonly PUBLIC_PORT=$((PORT_BASE + 3))
 readonly BACKEND_PORT=$((PORT_BASE + 4))
 readonly MIXED_PORT=$((PORT_BASE + 5))
 
-[[ -f "$MIHOMO_DIR/go.mod" ]] || {
+[[ -n "$MIHOMO_BIN" && -x "$MIHOMO_BIN" ]] || [[ -f "$MIHOMO_DIR/go.mod" ]] || {
     echo "Set MIHOMO_DIR to the modified Mihomo checkout" >&2
     exit 1
 }
@@ -70,7 +71,11 @@ wait_for_tcp() {
 echo "==> Building v2node, Mihomo and E2E helper"
 (cd "$REPO_DIR" && GOTOOLCHAIN=auto GOEXPERIMENT=jsonv2 go build -o "$test_dir/v2node" .)
 (cd "$REPO_DIR" && GOTOOLCHAIN=auto go build -o "$test_dir/nextv1e2e" ./test/nextv1e2e)
-(cd "$MIHOMO_DIR" && GOTOOLCHAIN=auto go build -o "$test_dir/mihomo-bin" .)
+if [[ -n "$MIHOMO_BIN" ]]; then
+    cp "$MIHOMO_BIN" "$test_dir/mihomo-bin"
+else
+    (cd "$MIHOMO_DIR" && GOTOOLCHAIN=auto go build -o "$test_dir/mihomo-bin" .)
+fi
 
 echo "==> Generating disposable server and client certificates"
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 \
