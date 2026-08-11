@@ -75,6 +75,17 @@ func nextNode(host string, id, frontend, backend int) *panel.NodeInfo {
 	}
 }
 
+func regularNode(host string, id, port int, protocol string) *panel.NodeInfo {
+	return &panel.NodeInfo{
+		Id:      id,
+		APIHost: host,
+		Type:    protocol,
+		Common: &panel.CommonNode{
+			ServerPort: port,
+		},
+	}
+}
+
 func installTestCertificates(t *testing.T, m *Manager, nodes ...*panel.NodeInfo) {
 	t.Helper()
 	for _, node := range nodes {
@@ -145,7 +156,7 @@ func TestApplyGeneratesStableMultipleNodeConfiguration(t *testing.T) {
 	}
 }
 
-func TestApplyRejectsGlobalPortConflicts(t *testing.T) {
+func TestApplyRejectsNextV1PortConflicts(t *testing.T) {
 	tests := []struct {
 		name  string
 		nodes []*panel.NodeInfo
@@ -166,6 +177,20 @@ func TestApplyRejectsGlobalPortConflicts(t *testing.T) {
 			nodes: []*panel.NodeInfo{nextNode("https://a", 1, 443, 24443), nextNode("https://a", 2, 8443, 24443)},
 			want:  "inner port 24443 is shared",
 		},
+		{
+			name:  "backend shared with AnyTLS",
+			nodes: []*panel.NodeInfo{nextNode("https://a", 1, 443, 24443), regularNode("https://a", 5, 24443, "anytls")},
+			want:  "inner port 24443 is shared",
+		},
+		{
+			name: "frontend conflicts with shared AnyTLS port",
+			nodes: []*panel.NodeInfo{
+				nextNode("https://a", 1, 12009, 24443),
+				regularNode("https://a", 5, 12009, "anytls"),
+				regularNode("https://a", 17, 12009, "anytls"),
+			},
+			want: "conflicts with inner port",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -176,6 +201,38 @@ func TestApplyRejectsGlobalPortConflicts(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestApplyAllowsSharedInnerPortForNonNextV1Nodes(t *testing.T) {
+	sharedA := regularNode("https://panel.example", 5, 12009, "anytls")
+	sharedB := regularNode("https://panel.example", 17, 12009, "anytls")
+
+	t.Run("without Next-V1", func(t *testing.T) {
+		runner := &fakeRunner{}
+		m := testManager(t, runner)
+		if err := m.Validate([]*panel.NodeInfo{sharedA, sharedB}); err != nil {
+			t.Fatalf("Validate() rejected unrelated shared port: %v", err)
+		}
+		if err := m.Apply([]*panel.NodeInfo{sharedA, sharedB}); err != nil {
+			t.Fatalf("Apply() rejected unrelated shared port: %v", err)
+		}
+		if len(runner.calls) != 0 {
+			t.Fatalf("unexpected HAProxy commands: %v", runner.calls)
+		}
+	})
+
+	t.Run("alongside Next-V1", func(t *testing.T) {
+		runner := &fakeRunner{}
+		m := testManager(t, runner)
+		next := nextNode("https://panel.example", 23, 40443, 24443)
+		installTestCertificates(t, m, next)
+		if err := m.Apply([]*panel.NodeInfo{sharedA, sharedB, next}); err != nil {
+			t.Fatalf("Apply() rejected unrelated shared port: %v", err)
+		}
+		if len(runner.calls) != 3 {
+			t.Fatalf("commands = %v, want check, enable, reload-or-restart", runner.calls)
+		}
+	})
 }
 
 func TestApplyDoesNothingWithoutNextV1Nodes(t *testing.T) {

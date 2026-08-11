@@ -232,7 +232,18 @@ func (m *Manager) setDefaults() error {
 
 func (m *Manager) routes(infos []*panel.NodeInfo) ([]route, error) {
 	var routes []route
-	allInnerPorts := make(map[int]string)
+	hasNextV1 := false
+	for _, info := range infos {
+		if info != nil && info.Type == "next-v1" {
+			hasNextV1 = true
+			break
+		}
+	}
+	if !hasNextV1 {
+		return nil, nil
+	}
+
+	allInnerPorts := make(map[int][]string)
 	frontendPorts := make(map[int]string)
 	seenNodes := make(map[string]struct{})
 
@@ -248,12 +259,14 @@ func (m *Manager) routes(infos []*panel.NodeInfo) ([]route, error) {
 			continue
 		}
 		if err := validPort(port); err != nil {
-			return nil, fmt.Errorf("node %s inner port: %w", nodeDescription(info), err)
+			// HAProxy only owns Next-V1. Leave invalid ports on unrelated
+			// protocols to the core that creates those listeners.
+			if info.Type == "next-v1" {
+				return nil, fmt.Errorf("node %s inner port: %w", nodeDescription(info), err)
+			}
+			continue
 		}
-		if owner, exists := allInnerPorts[port]; exists {
-			return nil, fmt.Errorf("inner port %d is shared by %s and %s", port, owner, nodeDescription(info))
-		}
-		allInnerPorts[port] = nodeDescription(info)
+		allInnerPorts[port] = append(allInnerPorts[port], nodeDescription(info))
 	}
 
 	for _, info := range infos {
@@ -271,6 +284,13 @@ func (m *Manager) routes(infos []*panel.NodeInfo) ([]route, error) {
 			return nil, fmt.Errorf("duplicate Next-V1 node identity %s", nodeDescription(info))
 		}
 		seenNodes[key] = struct{}{}
+		backendPort := info.Common.ServerPort
+		if backendPort == 0 {
+			backendPort = 24443
+		}
+		if owners := allInnerPorts[backendPort]; len(owners) > 1 {
+			return nil, fmt.Errorf("inner port %d is shared by %s", backendPort, strings.Join(owners, " and "))
+		}
 
 		frontendPort := info.Common.OuterTLS.FrontendPort
 		if frontendPort == 0 {
@@ -282,15 +302,11 @@ func (m *Manager) routes(infos []*panel.NodeInfo) ([]route, error) {
 		if owner, exists := frontendPorts[frontendPort]; exists {
 			return nil, fmt.Errorf("HAProxy frontend port %d is shared by %s and %s", frontendPort, owner, nodeDescription(info))
 		}
-		if owner, exists := allInnerPorts[frontendPort]; exists {
-			return nil, fmt.Errorf("HAProxy frontend port %d for %s conflicts with inner port used by %s", frontendPort, nodeDescription(info), owner)
+		if owners := allInnerPorts[frontendPort]; len(owners) > 0 {
+			return nil, fmt.Errorf("HAProxy frontend port %d for %s conflicts with inner port used by %s", frontendPort, nodeDescription(info), strings.Join(owners, ", "))
 		}
 		frontendPorts[frontendPort] = nodeDescription(info)
 
-		backendPort := info.Common.ServerPort
-		if backendPort == 0 {
-			backendPort = 24443
-		}
 		dir := filepath.Join(m.NodesDir, key)
 		certificate := filepath.Join(dir, "private", "haproxy.pem")
 		clientCA := filepath.Join(dir, "client-ca.crt")
