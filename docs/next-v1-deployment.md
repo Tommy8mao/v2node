@@ -48,6 +48,51 @@ server CA and the SHA-256 pin written into the node's `client.yaml`;
 `skip-cert-verify` remains false. Re-running with the same server name keeps the
 same identities unless `--rotate-client` is explicitly supplied.
 
+After the first successful bootstrap, the panel keeps a protected recovery copy
+of the shared client identity, its public client CA certificate, and (for
+self-signed mode) the node's server certificate and private key. A later
+one-click install for the same panel node restores and validates that identity
+instead of silently generating a different one. This lets multiple machines
+serve one node for DNS or load-balancer failover while presenting the same mTLS
+identity. The CA private keys remain local and are never uploaded to the panel.
+
+For active/active or failover service, every machine must use the same server
+name and public port. Point that name at the failover/load-balancer addresses,
+save the node to mint a fresh one-time command for each machine, and run each
+command separately. An install command is single-use even though the recovered
+certificate identity is shared.
+
+When upgrading a node that was installed before cluster recovery was available,
+run the new one-click command on the original machine first. The installer
+compares that machine's public certificate fingerprints with the panel and
+backfills the missing recovery fields. A fresh machine is deliberately refused
+while the panel reports a legacy/incomplete identity, so it cannot replace the
+live node's certificates by accident. After that first backfill, save the node
+again to mint a new one-time command for every additional machine.
+
+Private client and self-signed server leaf certificates are valid for 825 days;
+their CAs are valid for 3650 days. The original issuing machine keeps the CA
+private keys; recovered machines intentionally do not receive them. At least 30
+days before the client leaf expires, save the node and append `--rotate-client`
+to the command on that original machine. This signs a new client leaf with the
+same client CA, so all HAProxy members continue accepting both cached and newly
+downloaded client identities.
+
+Self-signed server renewal is an explicit maintenance operation because clients
+may pin its leaf fingerprint. Hide the node, save it, append `--rotate-server`
+on the original issuing machine, then save and run the ordinary command on the
+other members so they restore the renewed server identity. Refresh client
+subscriptions before re-enabling the node. The installer never silently creates
+a replacement CA for an incomplete, renamed, or expiring identity. CA renewal
+itself is a coordinated migration; create a replacement node/identity before the
+3650-day CA lifetime ends.
+
+Let's Encrypt server certificates follow Certbot's normal renewal cycle and its
+deployment hook reloads HAProxy automatically. Do not run independent standalone
+HTTP-01 issuance behind round-robin DNS unless every challenge is routed to the
+requesting machine; use DNS-01, a centralized certificate distributor, or
+`--existing-cert` for that topology.
+
 ## Production with Let's Encrypt
 
 Point the domain's A/AAAA record at the server and allow inbound TCP port 80 for
@@ -65,10 +110,10 @@ with `--existing-cert /path/to/fullchain.pem --existing-key /path/to/privkey.pem
 
 ## Shared client certificate rotation
 
-Save the node again to authorize a new identity, copy the refreshed command and
-add `--rotate-client`. This replaces the client CA and
-shared certificate, updates HAProxy, and invalidates all previously delivered
-client certificates immediately. Redistribute the node-specific `client.yaml`
+Save the node again, copy the refreshed command and add `--rotate-client` on the
+original issuing machine. This renews only the shared client leaf and keeps the
+client CA unchanged. HAProxy members therefore accept the old leaf until its own
+expiry as well as the newly issued leaf. Redistribute the refreshed identity
 only through the protected panel subscription path.
 
 ## Checks

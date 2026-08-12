@@ -10,7 +10,7 @@ readonly NEXTV1_ROOT="/etc/next-v1"
 readonly NEXTV1_NODES_DIR="$NEXTV1_ROOT/nodes"
 readonly HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 readonly DEFAULT_RELEASE_REPOSITORY="Tommy8mao/v2node"
-readonly DEFAULT_RELEASE_VERSION="v0.4.4-next-v1.3"
+readonly DEFAULT_RELEASE_VERSION="v0.4.4-next-v1.5"
 
 frontend_port=443
 backend_host="127.0.0.1"
@@ -33,6 +33,7 @@ bootstrap_token=""
 bootstrap_token_file=""
 staged_binary=""
 rotate_client=false
+rotate_server=false
 replace_haproxy_config=false
 bootstrap_published=false
 node_key=""
@@ -40,6 +41,13 @@ NEXTV1_DIR=""
 activation_rollback_dir=""
 identity_rollback_dir=""
 port_check_token_file=""
+panel_identity_dir=""
+bootstrap_config_dir=""
+bootstrap_publish_dir=""
+panel_identity_state="unknown"
+panel_certificate_mode="unknown"
+legacy_identity_verified=false
+manual_credential_file=""
 
 cleanup_runtime_files() {
     if [[ -n "$identity_rollback_dir" ]]; then
@@ -49,8 +57,24 @@ cleanup_runtime_files() {
         rollback_activation || true
     fi
     [[ -n "$api_key_file" ]] && rm -f "$api_key_file" "$api_key_file.next"
+    if [[ -n "$manual_credential_file" &&
+          "$manual_credential_file" == "$NEXTV1_DIR/private/panel-api-key.manual.tmp" ]]; then
+        rm -f "$manual_credential_file"
+    fi
     [[ -n "$bootstrap_token_file" ]] && rm -f "$bootstrap_token_file" "$bootstrap_token_file.next"
     [[ -n "$port_check_token_file" ]] && rm -f "$port_check_token_file"
+    if [[ -n "$bootstrap_config_dir" &&
+          "$bootstrap_config_dir" == "$NEXTV1_DIR/private"/bootstrap-config.* ]]; then
+        rm -rf -- "$bootstrap_config_dir"
+    fi
+    if [[ -n "$bootstrap_publish_dir" &&
+          "$bootstrap_publish_dir" == "$NEXTV1_DIR/private"/bootstrap-publish.* ]]; then
+        rm -rf -- "$bootstrap_publish_dir"
+    fi
+    if [[ -n "$panel_identity_dir" &&
+          "$panel_identity_dir" == "$NEXTV1_DIR/private"/panel-identity.* ]]; then
+        rm -rf -- "$panel_identity_dir"
+    fi
     [[ -n "$staged_binary" ]] && rm -f "$staged_binary"
     rm -f "$INSTALL_DIR/geoip.dat.next-v1.new" "$INSTALL_DIR/geosite.dat.next-v1.new"
     rm -f "$V2NODE_CONFIG_DIR/config.json.next-v1.new" \
@@ -83,7 +107,8 @@ TLS options:
   --existing-key FILE           Use the matching existing private key
   --server-name NAME            Certificate DNS name (default: next-v1.local)
   --email ADDRESS               Required with --letsencrypt
-  --rotate-client               Replace the shared mTLS client certificate
+  --rotate-client               Renew the shared client leaf with its existing CA
+  --rotate-server               Renew the self-signed server leaf with its existing CA
   --replace-haproxy-config      Authorize takeover of a non-Next-V1 HAProxy config
 
 Service options:
@@ -96,7 +121,7 @@ Service options:
   --archive-sha256-arm64 HASH   Pin the Linux arm64 release archive
   --api-host URL                Panel URL for a new v2node config
   --node-id ID                  Panel node ID for a new v2node config
-  --api-key KEY                 Panel API key (or set V2NODE_API_KEY)
+  --api-key KEY                 Legacy existing-machine credential; not for first install
   --bootstrap-token-stdin       Read the one-time node token from standard input
   -h, --help                    Show this help
 
@@ -219,6 +244,8 @@ parse_args() {
                 shift ;;
             --rotate-client)
                 rotate_client=true; shift ;;
+            --rotate-server)
+                rotate_server=true; shift ;;
             --replace-haproxy-config)
                 replace_haproxy_config=true; shift ;;
             -h|--help)
@@ -264,6 +291,9 @@ validate_args() {
             ;;
         *) die "invalid certificate mode" ;;
     esac
+    if [[ "$rotate_server" == true && "$cert_mode" != "self-signed" ]]; then
+        die "--rotate-server is only valid with --self-signed"
+    fi
 
     if [[ -n "$binary_path" ]]; then
         [[ -f "$binary_path" && -r "$binary_path" ]] || die "cannot read --binary $binary_path"
@@ -273,8 +303,14 @@ validate_args() {
     fi
     if [[ -n "$bootstrap_token" ]]; then
         [[ "$bootstrap_token" =~ ^[a-f0-9]{64}$ ]] || die "invalid --bootstrap-token"
+        # A one-time bootstrap must fetch the panel-authoritative cluster identity.
+        # Ignore a stale environment API key instead of silently skipping recovery.
+        api_key=""
     fi
     [[ -n "$api_host" && -n "$node_id" ]] || die "panel host and node ID are required"
+    if [[ -n "$api_key" && -z "$bootstrap_token" ]]; then
+        die "--api-key/V2NODE_API_KEY cannot create or recover cluster identity; use the panel one-time command"
+    fi
     if [[ ! -f "$V2NODE_CONFIG_DIR/config.json" ]]; then
         [[ -n "$api_key" || -n "$bootstrap_token" ]] ||
             die "new v2node install requires bootstrap credentials"
@@ -408,17 +444,17 @@ stage_v2node() {
 }
 
 fetch_panel_api_key() {
-    local endpoint payload_dir payload response next_token_file
-    [[ -n "$api_key" || -z "$bootstrap_token" ]] && return
+    local endpoint payload response next_token_file
+    [[ -z "$bootstrap_token" ]] && return
     [[ -n "$bootstrap_token" ]] || die "no panel API key or bootstrap token is available"
     endpoint="${api_host%/}/api/v2/server/next-v1/bootstrap/config"
-    payload_dir=$(mktemp -d "${TMPDIR:-/tmp}/next-v1-bootstrap-config.XXXXXX")
-    payload="$payload_dir/payload.json"
+    bootstrap_config_dir=$(mktemp -d "$NEXTV1_DIR/private/bootstrap-config.XXXXXX")
+    payload="$bootstrap_config_dir/payload.json"
     bootstrap_token_file="$NEXTV1_DIR/private/bootstrap-token.tmp"
     printf '%s' "$bootstrap_token" > "$bootstrap_token_file"
     chmod 0600 "$bootstrap_token_file"
     bootstrap_token=""
-    chmod 0700 "$payload_dir"
+    chmod 0700 "$bootstrap_config_dir"
     jq -n --argjson node_id "$node_id" --rawfile bootstrap_token "$bootstrap_token_file" \
         '{node_id:$node_id,bootstrap_token:$bootstrap_token}' > "$payload"
     chmod 0600 "$payload"
@@ -426,10 +462,12 @@ fetch_panel_api_key() {
     if ! response=$(curl --fail --silent --show-error --retry 3 \
           --connect-timeout 15 -H 'Content-Type: application/json' \
           --data-binary "@$payload" "$endpoint"); then
-        rm -rf "$payload_dir"
+        rm -rf -- "$bootstrap_config_dir"
+        bootstrap_config_dir=""
         die "panel bootstrap configuration request failed"
     fi
-    rm -rf "$payload_dir"
+    rm -rf -- "$bootstrap_config_dir"
+    bootstrap_config_dir=""
     api_key_file="$NEXTV1_DIR/private/panel-api-key.tmp"
     if ! jq -jer '.data.api_key | select(type == "string" and length > 0)' \
           <<<"$response" > "$api_key_file"; then
@@ -445,6 +483,80 @@ fetch_panel_api_key() {
     fi
     chmod 0600 "$next_token_file"
     mv "$next_token_file" "$bootstrap_token_file"
+
+    panel_identity_state=$(jq -er '.data.identity_state |
+        select(. == "empty" or . == "legacy" or . == "complete")' <<<"$response") ||
+        die "panel did not return a valid cluster identity state; update the panel before installing"
+    panel_certificate_mode=$(jq -er '.data.certificate_mode |
+        select(. == "self-signed" or . == "letsencrypt" or . == "existing")' <<<"$response") ||
+        die "panel did not return a valid server certificate mode"
+    if [[ "$cert_mode" == "self-signed" && "$panel_certificate_mode" != "self-signed" ]]; then
+        die "this node uses a public or externally managed server certificate; do not replace it with self-signed TLS"
+    fi
+    if [[ "$cert_mode" != "self-signed" && "$panel_certificate_mode" == "self-signed" &&
+          "$panel_identity_state" != "empty" ]]; then
+        die "this node uses a panel-managed self-signed server identity"
+    fi
+
+    if jq -e '.data.client_identity != null or .data.server_identity != null' \
+          >/dev/null 2>&1 <<<"$response"; then
+        panel_identity_dir=$(mktemp -d "$NEXTV1_DIR/private/panel-identity.XXXXXX")
+        chmod 0700 "$panel_identity_dir"
+    fi
+    if jq -e '
+          .data.client_identity |
+          type == "object" and
+          (.client_certificate | type == "string" and length > 0) and
+          (.client_private_key | type == "string" and length > 0) and
+          (.client_ca_certificate | type == "string" and length > 0)
+        ' >/dev/null 2>&1 <<<"$response"; then
+        jq -jer '.data.client_identity.client_certificate' <<<"$response" > "$panel_identity_dir/client.crt"
+        jq -jer '.data.client_identity.client_private_key' <<<"$response" > "$panel_identity_dir/client.key"
+        jq -jer '.data.client_identity.client_ca_certificate' <<<"$response" > "$panel_identity_dir/client-ca.crt"
+        chmod 0600 "$panel_identity_dir/client.crt" "$panel_identity_dir/client.key" \
+            "$panel_identity_dir/client-ca.crt"
+    elif jq -e '.data.client_identity != null' >/dev/null 2>&1 <<<"$response"; then
+        die "panel returned an incomplete reusable mTLS client identity"
+    fi
+    if jq -e '
+          .data.server_identity |
+          type == "object" and
+          (.server_name | type == "string" and length > 0) and
+          (.server_certificate | type == "string" and length > 0) and
+          (.server_private_key | type == "string" and length > 0) and
+          (.server_ca_certificate | type == "string" and length > 0)
+        ' >/dev/null 2>&1 <<<"$response"; then
+        jq -jer '.data.server_identity.server_name' <<<"$response" > "$panel_identity_dir/server-name"
+        jq -jer '.data.server_identity.server_certificate' <<<"$response" > "$panel_identity_dir/server.crt"
+        jq -jer '.data.server_identity.server_private_key' <<<"$response" > "$panel_identity_dir/server.key"
+        jq -jer '.data.server_identity.server_ca_certificate' <<<"$response" > "$panel_identity_dir/server-ca.crt"
+        chmod 0600 "$panel_identity_dir/server-name" "$panel_identity_dir/server.crt" \
+            "$panel_identity_dir/server.key" "$panel_identity_dir/server-ca.crt"
+    elif jq -e '.data.server_identity != null' >/dev/null 2>&1 <<<"$response"; then
+        die "panel returned an incomplete reusable self-signed server identity"
+    fi
+
+    if [[ "$panel_identity_state" == "legacy" ]]; then
+        [[ -n "$panel_identity_dir" ]] || {
+            panel_identity_dir=$(mktemp -d "$NEXTV1_DIR/private/panel-identity.XXXXXX")
+            chmod 0700 "$panel_identity_dir"
+        }
+        if jq -e '.data.legacy_identity.client_certificate | type == "string" and length > 0' \
+              >/dev/null 2>&1 <<<"$response"; then
+            jq -jer '.data.legacy_identity.client_certificate' <<<"$response" > \
+                "$panel_identity_dir/legacy-client.crt"
+        fi
+        if jq -e '.data.legacy_identity.ca_certificate | type == "string" and length > 0' \
+              >/dev/null 2>&1 <<<"$response"; then
+            jq -jer '.data.legacy_identity.ca_certificate' <<<"$response" > \
+                "$panel_identity_dir/legacy-server-ca.crt"
+        fi
+        jq -jr '.data.legacy_identity.fingerprint // ""' <<<"$response" > \
+            "$panel_identity_dir/legacy-server-fingerprint"
+        jq -jr '.data.legacy_identity.server_name // ""' <<<"$response" > \
+            "$panel_identity_dir/legacy-server-name"
+        chmod 0600 "$panel_identity_dir"/legacy-*
+    fi
 }
 
 validate_requested_port_conflicts() {
@@ -545,6 +657,94 @@ certificate_matches_key() {
     [[ "$certificate_public_key" == "$private_public_key" ]]
 }
 
+client_identity_is_valid() {
+    local ca_certificate="$1" client_certificate="$2" client_private_key="$3"
+    openssl x509 -in "$ca_certificate" -noout -checkend 2592000 >/dev/null 2>&1 &&
+        openssl x509 -in "$client_certificate" -noout -checkend 2592000 >/dev/null 2>&1 &&
+        openssl verify -purpose sslclient -CAfile "$ca_certificate" \
+            "$client_certificate" >/dev/null 2>&1 &&
+        certificate_matches_key "$client_certificate" "$client_private_key"
+}
+
+certificate_matches_server_name() {
+    local certificate="$1" expected_server_name="$2"
+    if [[ "$expected_server_name" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        openssl x509 -in "$certificate" -noout -checkip "$expected_server_name" >/dev/null 2>&1
+    else
+        openssl x509 -in "$certificate" -noout -checkhost "$expected_server_name" >/dev/null 2>&1
+    fi
+}
+
+server_identity_is_valid() {
+    local ca_certificate="$1" server_certificate="$2" server_private_key="$3" expected_server_name="$4"
+    openssl x509 -in "$ca_certificate" -noout -checkend 2592000 >/dev/null 2>&1 &&
+        openssl x509 -in "$server_certificate" -noout -checkend 2592000 >/dev/null 2>&1 &&
+        certificate_matches_server_name "$server_certificate" "$expected_server_name" &&
+        openssl verify -purpose sslserver -CAfile "$ca_certificate" \
+            "$server_certificate" >/dev/null 2>&1 &&
+        certificate_matches_key "$server_certificate" "$server_private_key"
+}
+
+same_certificate() {
+    local left="$1" right="$2" left_fingerprint right_fingerprint
+    left_fingerprint=$(openssl x509 -in "$left" -noout -fingerprint -sha256 2>/dev/null) || return 1
+    right_fingerprint=$(openssl x509 -in "$right" -noout -fingerprint -sha256 2>/dev/null) || return 1
+    [[ "$left_fingerprint" == "$right_fingerprint" ]]
+}
+
+same_private_key() {
+    local left="$1" right="$2" left_public_key right_public_key
+    left_public_key=$(openssl pkey -in "$left" -pubout -outform DER 2>/dev/null | openssl sha256) || return 1
+    right_public_key=$(openssl pkey -in "$right" -pubout -outform DER 2>/dev/null | openssl sha256) || return 1
+    [[ "$left_public_key" == "$right_public_key" ]]
+}
+
+validate_legacy_local_identity() {
+    [[ "$panel_identity_state" == "legacy" ]] || return 0
+    local local_client_ca="$NEXTV1_DIR/client-ca.crt"
+    local local_client_cert="$NEXTV1_DIR/shared-client.crt"
+    local local_client_key="$NEXTV1_DIR/private/shared-client.key"
+    local legacy_client_cert="$panel_identity_dir/legacy-client.crt"
+
+    [[ -s "$legacy_client_cert" ]] ||
+        die "panel has an incomplete legacy identity; repair it before adding another machine"
+    [[ -s "$local_client_ca" && -s "$local_client_cert" && -s "$local_client_key" ]] ||
+        die "this is a legacy node: run the new command on the original machine first to publish its cluster identity"
+    openssl x509 -in "$local_client_cert" -noout -checkend 0 >/dev/null 2>&1 &&
+        openssl verify -purpose sslclient -CAfile "$local_client_ca" \
+            "$local_client_cert" >/dev/null 2>&1 &&
+        certificate_matches_key "$local_client_cert" "$local_client_key" &&
+        same_certificate "$local_client_cert" "$legacy_client_cert" ||
+        die "local mTLS identity does not match the panel; use the original issuing machine to complete the upgrade"
+
+    if [[ "$cert_mode" == "self-signed" ]]; then
+        local local_server_ca="$NEXTV1_DIR/server-ca.crt"
+        local local_server_cert="$NEXTV1_DIR/server.crt"
+        local local_server_key="$NEXTV1_DIR/private/server.key"
+        local legacy_server_ca="$panel_identity_dir/legacy-server-ca.crt"
+        local legacy_fingerprint expected_fingerprint legacy_name
+        legacy_fingerprint=$(cat "$panel_identity_dir/legacy-server-fingerprint")
+        legacy_name=$(cat "$panel_identity_dir/legacy-server-name")
+        [[ -s "$legacy_server_ca" && "$legacy_fingerprint" =~ ^[a-f0-9]{64}$ &&
+              "$legacy_name" == "$server_name" ]] ||
+            die "panel legacy server identity is incomplete or uses a different SNI"
+        [[ -s "$local_server_ca" && -s "$local_server_cert" && -s "$local_server_key" ]] ||
+            die "the original self-signed server identity is missing on this machine"
+        expected_fingerprint=$(openssl x509 -in "$local_server_cert" -outform DER |
+            openssl dgst -sha256 -hex | awk '{print $2}')
+        [[ "$expected_fingerprint" == "$legacy_fingerprint" ]] &&
+            same_certificate "$local_server_ca" "$legacy_server_ca" &&
+            openssl x509 -in "$local_server_cert" -noout -checkend 0 >/dev/null 2>&1 &&
+            openssl verify -purpose sslserver -CAfile "$local_server_ca" \
+                "$local_server_cert" >/dev/null 2>&1 &&
+            certificate_matches_server_name "$local_server_cert" "$server_name" &&
+            certificate_matches_key "$local_server_cert" "$local_server_key" ||
+            die "local self-signed server identity does not match the panel legacy identity"
+    fi
+    legacy_identity_verified=true
+    info "Verified the original machine; its legacy identity will be upgraded for cluster recovery"
+}
+
 generate_client_identity() {
     local ca_key="$NEXTV1_DIR/private/client-ca.key"
     local ca_cert="$NEXTV1_DIR/client-ca.crt"
@@ -553,24 +753,91 @@ generate_client_identity() {
     local client_cert="$NEXTV1_DIR/shared-client.crt"
     local client_ext="$NEXTV1_DIR/private/client.ext"
 
+    if [[ "$panel_identity_state" == "complete" &&
+          ( ! -s "$panel_identity_dir/client-ca.crt" ||
+            ! -s "$panel_identity_dir/client.crt" ||
+            ! -s "$panel_identity_dir/client.key" ) ]]; then
+        die "panel cluster identity is complete but has no reusable mTLS client bundle"
+    fi
+
+    if [[ "$rotate_client" == false && -n "$panel_identity_dir" &&
+          -s "$panel_identity_dir/client-ca.crt" &&
+          -s "$panel_identity_dir/client.crt" && -s "$panel_identity_dir/client.key" ]]; then
+        if ! client_identity_is_valid "$panel_identity_dir/client-ca.crt" \
+              "$panel_identity_dir/client.crt" "$panel_identity_dir/client.key"; then
+            die "panel mTLS client identity is invalid or expires within 30 days; renew it on the original issuing machine with --rotate-client"
+        fi
+        if [[ ! -s "$ca_cert" || ! -s "$client_cert" || ! -s "$client_key" ]] ||
+              ! same_certificate "$ca_cert" "$panel_identity_dir/client-ca.crt" ||
+              ! same_certificate "$client_cert" "$panel_identity_dir/client.crt" ||
+              ! same_private_key "$client_key" "$panel_identity_dir/client.key"; then
+            info "Restoring the panel-authoritative shared mTLS client identity"
+            if [[ -s "$ca_key" ]] &&
+                  certificate_matches_key "$panel_identity_dir/client-ca.crt" "$ca_key"; then
+                info "Preserving the matching local client CA signing key"
+            else
+                rm -f "$ca_key" "$NEXTV1_DIR/client-ca.srl"
+            fi
+            install -m 0644 "$panel_identity_dir/client-ca.crt" "$ca_cert"
+            install -m 0644 "$panel_identity_dir/client.crt" "$client_cert"
+            install -m 0600 "$panel_identity_dir/client.key" "$client_key"
+        fi
+    fi
+
+    if [[ "$legacy_identity_verified" == true && "$rotate_client" == false ]]; then
+        info "Keeping the verified legacy mTLS client identity for recovery backfill"
+        return
+    fi
+
+    if [[ "$rotate_client" == true ]]; then
+        [[ "$panel_identity_state" != "legacy" ]] ||
+            die "backfill the legacy identity first, then save the node and run --rotate-client again"
+        [[ -s "$ca_key" && -s "$ca_cert" && -s "$client_cert" && -s "$client_key" ]] ||
+            die "client renewal must run on the original issuing machine that still has client-ca.key"
+        openssl x509 -in "$ca_cert" -noout -checkend 2592000 >/dev/null 2>&1 &&
+            certificate_matches_key "$ca_cert" "$ca_key" &&
+            openssl verify -no_check_time -purpose sslclient -CAfile "$ca_cert" \
+                "$client_cert" >/dev/null 2>&1 &&
+            certificate_matches_key "$client_cert" "$client_key" ||
+            die "the local client CA or current leaf identity is invalid"
+        if [[ -s "$panel_identity_dir/client-ca.crt" ]]; then
+            same_certificate "$ca_cert" "$panel_identity_dir/client-ca.crt" &&
+                same_certificate "$client_cert" "$panel_identity_dir/client.crt" ||
+                die "local client identity is not the panel-authoritative generation"
+        fi
+        info "Renewing the shared mTLS client leaf with the existing cluster CA"
+        openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$client_key"
+        openssl req -new -sha256 -key "$client_key" \
+            -subj "/CN=Next-V1 Shared Client" -out "$client_csr"
+        printf '%s\n' 'basicConstraints=critical,CA:FALSE' \
+            'keyUsage=critical,digitalSignature' \
+            'extendedKeyUsage=clientAuth' > "$client_ext"
+        openssl x509 -req -sha256 -days 825 -in "$client_csr" \
+            -CA "$ca_cert" -CAkey "$ca_key" -CAcreateserial \
+            -extfile "$client_ext" -out "$client_cert"
+        chmod 0600 "$ca_key" "$client_key"
+        chmod 0644 "$ca_cert" "$client_cert"
+        return
+    fi
+
     if [[ "$rotate_client" == false && (-e "$ca_key" || -e "$ca_cert" || -e "$client_key" || -e "$client_cert") ]]; then
         if [[ -s "$ca_key" && -s "$ca_cert" && -s "$client_key" && -s "$client_cert" ]] &&
-              openssl x509 -in "$ca_cert" -noout -checkend 2592000 >/dev/null 2>&1 &&
-              openssl x509 -in "$client_cert" -noout -checkend 2592000 >/dev/null 2>&1 &&
-              openssl verify -CAfile "$ca_cert" "$client_cert" >/dev/null 2>&1 &&
-              certificate_matches_key "$client_cert" "$client_key" &&
+              client_identity_is_valid "$ca_cert" "$client_cert" "$client_key" &&
               certificate_matches_key "$ca_cert" "$ca_key"; then
             info "Keeping existing shared mTLS client identity"
+            return
+        fi
+        if [[ ! -e "$ca_key" && -s "$ca_cert" && -s "$client_key" && -s "$client_cert" ]] &&
+              client_identity_is_valid "$ca_cert" "$client_cert" "$client_key"; then
+            info "Keeping restored shared mTLS client identity"
             return
         fi
         die "existing client identity is incomplete, mismatched, or expires within 30 days; inspect it and use --rotate-client"
     fi
 
-    if [[ "$rotate_client" == true ]]; then
-        info "Rotating shared mTLS client CA and certificate"
-    else
-        info "Generating shared mTLS client CA and certificate"
-    fi
+    [[ "$panel_identity_state" == "empty" ]] ||
+        die "refusing to generate a new client CA for a non-empty panel node"
+    info "Generating shared mTLS client CA and certificate"
     umask 077
     openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$ca_key"
     openssl req -x509 -new -sha256 -days 3650 -key "$ca_key" \
@@ -600,15 +867,115 @@ generate_self_signed_server() {
     local fullchain="$NEXTV1_DIR/server-fullchain.pem"
     local identity_name="$NEXTV1_DIR/private/server-name" subject_alt_name
 
+    if [[ "$panel_identity_state" == "complete" &&
+          ( ! -s "$panel_identity_dir/server-name" ||
+            ! -s "$panel_identity_dir/server.crt" ||
+            ! -s "$panel_identity_dir/server.key" ||
+            ! -s "$panel_identity_dir/server-ca.crt" ) ]]; then
+        die "panel cluster identity is complete but has no reusable self-signed server bundle"
+    fi
+    if [[ "$panel_identity_state" == "complete" &&
+          "$(cat "$panel_identity_dir/server-name")" != "$server_name" ]]; then
+        die "requested SNI does not match the panel-authoritative self-signed server identity"
+    fi
+
+    if [[ "$rotate_server" == false && -n "$panel_identity_dir" &&
+          -s "$panel_identity_dir/server-name" &&
+          -s "$panel_identity_dir/server.crt" && -s "$panel_identity_dir/server.key" &&
+          -s "$panel_identity_dir/server-ca.crt" &&
+          "$(cat "$panel_identity_dir/server-name")" == "$server_name" ]]; then
+        if ! server_identity_is_valid "$panel_identity_dir/server-ca.crt" \
+              "$panel_identity_dir/server.crt" "$panel_identity_dir/server.key" "$server_name"; then
+            die "panel self-signed server identity is invalid or expires within 30 days"
+        fi
+        if [[ ! -s "$ca_cert" || ! -s "$server_cert" || ! -s "$server_key" ]] ||
+              ! same_certificate "$ca_cert" "$panel_identity_dir/server-ca.crt" ||
+              ! same_certificate "$server_cert" "$panel_identity_dir/server.crt" ||
+              ! same_private_key "$server_key" "$panel_identity_dir/server.key"; then
+            info "Restoring the panel-authoritative shared self-signed server identity"
+            if [[ -s "$NEXTV1_DIR/private/server-ca.key" ]] &&
+                  certificate_matches_key "$panel_identity_dir/server-ca.crt" \
+                      "$NEXTV1_DIR/private/server-ca.key"; then
+                info "Preserving the matching local server CA signing key"
+            else
+                rm -f "$NEXTV1_DIR/private/server-ca.key" "$NEXTV1_DIR/server-ca.srl"
+            fi
+            install -m 0644 "$panel_identity_dir/server-ca.crt" "$ca_cert"
+            install -m 0644 "$panel_identity_dir/server.crt" "$server_cert"
+            install -m 0600 "$panel_identity_dir/server.key" "$server_key"
+        fi
+        {
+            sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$server_cert"
+            sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$ca_cert"
+        } > "$fullchain"
+        printf '%s\n' "$server_name" > "$identity_name"
+    fi
+
+    if [[ "$legacy_identity_verified" == true && "$rotate_server" == false ]]; then
+        {
+            sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$server_cert"
+            sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$ca_cert"
+        } > "$fullchain"
+        printf '%s\n' "$server_name" > "$identity_name"
+        install -m 0600 "$server_key" "$NEXTV1_DIR/private/haproxy-server.key"
+        info "Keeping the verified legacy self-signed server identity for recovery backfill"
+        return
+    fi
+
+    if [[ "$rotate_server" == true ]]; then
+        [[ "$panel_identity_state" != "legacy" ]] ||
+            die "backfill the legacy identity before renewing its server certificate"
+        [[ -s "$ca_key" && -s "$ca_cert" && -s "$server_key" && -s "$server_cert" ]] ||
+            die "server renewal must run on the original issuing machine that still has server-ca.key"
+        openssl x509 -in "$ca_cert" -noout -checkend 2592000 >/dev/null 2>&1 &&
+            certificate_matches_key "$ca_cert" "$ca_key" &&
+            openssl verify -no_check_time -purpose sslserver -CAfile "$ca_cert" \
+                "$server_cert" >/dev/null 2>&1 &&
+            certificate_matches_server_name "$server_cert" "$server_name" &&
+            certificate_matches_key "$server_cert" "$server_key" ||
+            die "the local server CA or current server leaf identity is invalid"
+        if [[ -n "$panel_identity_dir" && -s "$panel_identity_dir/server-ca.crt" ]]; then
+            same_certificate "$ca_cert" "$panel_identity_dir/server-ca.crt" &&
+                same_certificate "$server_cert" "$panel_identity_dir/server.crt" ||
+                die "local server identity is not the panel-authoritative generation"
+        fi
+        info "Renewing the self-signed server leaf with the existing cluster CA"
+        subject_alt_name=$(server_subject_alt_name "$server_name")
+        openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$server_key"
+        openssl req -new -sha256 -key "$server_key" \
+            -subj "/CN=$server_name" -out "$server_csr"
+        printf '%s\n' 'basicConstraints=critical,CA:FALSE' \
+            'keyUsage=critical,digitalSignature,keyEncipherment' \
+            'extendedKeyUsage=serverAuth' \
+            "subjectAltName=$subject_alt_name" > "$server_ext"
+        openssl x509 -req -sha256 -days 825 -in "$server_csr" \
+            -CA "$ca_cert" -CAkey "$ca_key" -CAcreateserial \
+            -extfile "$server_ext" -out "$server_cert"
+        {
+            sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$server_cert"
+            sed -n '/BEGIN CERTIFICATE/,/END CERTIFICATE/p' "$ca_cert"
+        } > "$fullchain"
+        printf '%s\n' "$server_name" > "$identity_name"
+        install -m 0600 "$server_key" "$NEXTV1_DIR/private/haproxy-server.key"
+        return
+    fi
+
     if [[ -s "$server_key" && -s "$server_cert" && -s "$ca_cert" &&
           -s "$fullchain" && -s "$identity_name" &&
           "$(cat "$identity_name")" == "$server_name" ]] &&
-          openssl x509 -in "$server_cert" -noout -checkend 86400 >/dev/null 2>&1; then
+          server_identity_is_valid "$ca_cert" "$server_cert" "$server_key" "$server_name"; then
         info "Keeping existing self-signed server identity for $server_name"
         install -m 0600 "$server_key" "$NEXTV1_DIR/private/haproxy-server.key"
         return
     fi
 
+    if [[ -e "$ca_key" || -e "$ca_cert" || -e "$server_key" || -e "$server_cert" ||
+          -e "$fullchain" || -e "$identity_name" ]]; then
+        die "existing self-signed server identity is incomplete, mismatched, or expires within 30 days; inspect it and use --rotate-server on the original issuing machine"
+    fi
+
+    [[ "$panel_identity_state" == "empty" ]] ||
+        die "refusing to generate a new self-signed identity for a non-empty panel node"
     info "Generating self-signed server certificate for $server_name"
     subject_alt_name=$(server_subject_alt_name "$server_name")
     umask 077
@@ -903,7 +1270,6 @@ install_v2node() {
     local unit_candidate=/etc/systemd/system/v2node.service.next-v1.new
 
     local credential_file="$api_key_file"
-    local manual_credential_file=""
     if [[ -z "$credential_file" && -n "$api_key" ]]; then
         manual_credential_file="$NEXTV1_DIR/private/panel-api-key.manual.tmp"
         printf '%s' "$api_key" > "$manual_credential_file"
@@ -928,7 +1294,10 @@ install_v2node() {
             "$api_host" "$node_id" "$credential_file" ||
             die "could not add or update the v2node panel node"
     fi
-    [[ -n "$manual_credential_file" ]] && rm -f "$manual_credential_file"
+    if [[ -n "$manual_credential_file" ]]; then
+        rm -f "$manual_credential_file"
+        manual_credential_file=""
+    fi
     if [[ -n "$api_key_file" ]]; then
         rm -f "$api_key_file"
         api_key_file=""
@@ -975,42 +1344,60 @@ EOF
 }
 
 publish_client_bundle() {
-    local endpoint payload_dir payload server_ca_file fingerprint response
+    local endpoint payload server_ca_file server_cert_file server_key_file fingerprint response
     [[ -n "$api_host" && -n "$node_id" && -s "$bootstrap_token_file" ]] || return 0
     endpoint="${api_host%/}/api/v2/server/next-v1/bootstrap"
-    payload_dir=$(mktemp -d "${TMPDIR:-/tmp}/next-v1-bootstrap.XXXXXX")
-    payload="$payload_dir/payload.json"
-    server_ca_file="$payload_dir/server-ca.crt"
+    bootstrap_publish_dir=$(mktemp -d "$NEXTV1_DIR/private/bootstrap-publish.XXXXXX")
+    payload="$bootstrap_publish_dir/payload.json"
+    server_ca_file="$bootstrap_publish_dir/server-ca.crt"
+    server_cert_file="$bootstrap_publish_dir/server.crt"
+    server_key_file="$bootstrap_publish_dir/server.key"
     if [[ "$cert_mode" == "self-signed" ]]; then
         cp "$NEXTV1_DIR/server-ca.crt" "$server_ca_file"
+        cp "$NEXTV1_DIR/server.crt" "$server_cert_file"
+        cp "$NEXTV1_DIR/private/server.key" "$server_key_file"
         fingerprint=$(openssl x509 -in "$NEXTV1_DIR/server-fullchain.pem" -outform DER |
             openssl dgst -sha256 -hex | awk '{print $2}')
     else
         : > "$server_ca_file"
+        : > "$server_cert_file"
+        : > "$server_key_file"
         fingerprint=""
     fi
-    chmod 0700 "$payload_dir"
+    chmod 0700 "$bootstrap_publish_dir"
     jq -n \
         --argjson node_id "$node_id" \
         --rawfile bootstrap_token "$bootstrap_token_file" \
         --arg server_name "$server_name" \
+        --arg certificate_mode "$cert_mode" \
         --arg fingerprint "$fingerprint" \
         --argjson alpn '["next-v1"]' \
         --rawfile certificate "$NEXTV1_DIR/shared-client.crt" \
         --rawfile private_key "$NEXTV1_DIR/private/shared-client.key" \
+        --rawfile client_ca_certificate "$NEXTV1_DIR/client-ca.crt" \
         --rawfile ca_certificate "$server_ca_file" \
+        --rawfile server_certificate "$server_cert_file" \
+        --rawfile server_private_key "$server_key_file" \
+        --rawfile server_ca_certificate "$server_ca_file" \
         '{node_id:$node_id,bootstrap_token:$bootstrap_token,server_name:$server_name,
+          certificate_mode:$certificate_mode,
           fingerprint:$fingerprint,alpn:$alpn,client_certificate:$certificate,
-          client_private_key:$private_key,ca_certificate:$ca_certificate}' > "$payload"
+          client_private_key:$private_key,client_ca_certificate:$client_ca_certificate,
+          ca_certificate:$ca_certificate,
+          server_certificate:(if $server_certificate == "" then null else $server_certificate end),
+          server_private_key:(if $server_private_key == "" then null else $server_private_key end),
+          server_ca_certificate:(if $server_ca_certificate == "" then null else $server_ca_certificate end)}' > "$payload"
     chmod 0600 "$payload"
     info "Publishing the generated mTLS client identity to the panel"
     if ! response=$(curl --fail --silent --show-error --retry 3 \
           --connect-timeout 15 -H 'Content-Type: application/json' \
           --data-binary "@$payload" "$endpoint"); then
-        rm -rf "$payload_dir"
+        rm -rf -- "$bootstrap_publish_dir"
+        bootstrap_publish_dir=""
         die "panel bootstrap request failed: $endpoint"
     fi
-    rm -rf "$payload_dir"
+    rm -rf -- "$bootstrap_publish_dir"
+    bootstrap_publish_dir=""
     if ! jq -e '.data == true' >/dev/null 2>&1 <<<"$response"; then
         die "panel rejected the Next-V1 bootstrap identity"
     fi
@@ -1081,6 +1468,7 @@ main() {
     prepare_directories
     migrate_legacy_single_node
     fetch_panel_api_key
+    validate_legacy_local_identity
     stage_v2node
     generate_client_identity
     prepare_server_identity
