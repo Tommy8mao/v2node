@@ -10,7 +10,7 @@ readonly NEXTV1_ROOT="/etc/next-v1"
 readonly NEXTV1_NODES_DIR="$NEXTV1_ROOT/nodes"
 readonly HAPROXY_CONFIG="/etc/haproxy/haproxy.cfg"
 readonly DEFAULT_RELEASE_REPOSITORY="Tommy8mao/v2node"
-readonly DEFAULT_RELEASE_VERSION="v0.4.4-next-v1.5"
+readonly DEFAULT_RELEASE_VERSION="v0.4.4-next-v1.6"
 
 frontend_port=443
 backend_host="127.0.0.1"
