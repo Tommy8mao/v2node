@@ -40,6 +40,8 @@ VERSION_ARG=""
 API_HOST_ARG=""
 NODE_ID_ARG=""
 API_KEY_ARG=""
+PRIVATE_PACKAGES=false
+PACKAGE_BASE_URL=""
 
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -50,8 +52,12 @@ parse_args() {
                 NODE_ID_ARG="$2"; shift 2 ;;
             --api-key)
                 API_KEY_ARG="$2"; shift 2 ;;
+            --private-packages)
+                PRIVATE_PACKAGES=true; shift ;;
+            --package-base-url)
+                PACKAGE_BASE_URL="$2"; shift 2 ;;
             -h|--help)
-                echo "用法: $0 [版本号] [--api-host URL] [--node-id ID] [--api-key KEY]"
+                echo "用法: $0 [版本号] [--api-host URL] [--node-id ID] [--api-key KEY] [--private-packages --package-base-url URL]"
                 exit 0 ;;
             --*)
                 echo "未知参数: $1"; exit 1 ;;
@@ -176,23 +182,23 @@ install_base() {
             echo "安装 EPEL 源..."
             yum install -y epel-release >/dev/null 2>&1
         fi
-        need_install_yum wget curl unzip tar cronie socat ca-certificates pv
+        need_install_yum wget curl unzip tar cronie socat ca-certificates pv jq
         update-ca-trust force-enable >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"alpine" ]]; then
-        need_install_apk wget curl unzip tar socat ca-certificates pv
+        need_install_apk wget curl unzip tar socat ca-certificates pv jq
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"debian" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv
+        need_install_apt wget curl unzip tar cron socat ca-certificates pv jq
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"ubuntu" ]]; then
-        need_install_apt wget curl unzip tar cron socat ca-certificates pv
+        need_install_apt wget curl unzip tar cron socat ca-certificates pv jq
         update-ca-certificates >/dev/null 2>&1 || true
     elif [[ x"${release}" == x"arch" ]]; then
         echo "更新包数据库..."
         pacman -Sy --noconfirm >/dev/null 2>&1
         # --needed 会跳过已安装的包，非常高效
         echo "安装必需的包..."
-        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv >/dev/null 2>&1
+        pacman -S --noconfirm --needed wget curl unzip tar cronie socat ca-certificates pv jq >/dev/null 2>&1
     fi
 }
 
@@ -257,40 +263,49 @@ EOF
         fi
 }
 
+download_private_file() {
+    local path="$1" output="$2"
+    [[ "$PACKAGE_BASE_URL" =~ ^https://[^[:space:]]+$ && -n "$API_KEY_ARG" ]] || {
+        echo -e "${red}面板私有安装包地址或节点通讯密钥缺失${plain}" >&2
+        return 1
+    }
+    curl --fail --location --silent --show-error --retry 3 \
+        -H "X-V2node-Install-Key: $API_KEY_ARG" \
+        "${PACKAGE_BASE_URL%/}/$path" -o "$output"
+}
+
 install_v2node() {
-    local version_param="$1"
+    local version_param="$1" archive_name="v2node-linux-${arch}.zip" download_dir url
+    download_dir=$(mktemp -d "${TMPDIR:-/tmp}/v2node-install.XXXXXX") || exit 1
+    if [[ "$PRIVATE_PACKAGES" == true ]]; then
+        if [[ -z "$version_param" ]]; then
+            download_private_file manifest.json "$download_dir/manifest.json" || exit 1
+            last_version=$(jq -er '.latest_version | select(type == "string")' "$download_dir/manifest.json") || exit 1
+        else
+            last_version="$version_param"
+        fi
+        [[ "$last_version" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,79}$ ]] || exit 1
+        download_private_file "$last_version/$archive_name" "$download_dir/$archive_name" || exit 1
+        download_private_file "$last_version/$archive_name.sha256" "$download_dir/$archive_name.sha256" || exit 1
+        (cd "$download_dir" && sha256sum -c "$archive_name.sha256") || exit 1
+    else
+        if [[ -z "$version_param" ]]; then
+            last_version=$(curl --fail --location --silent --show-error "https://api.github.com/repos/Tommy8mao/v2node/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
+        else
+            last_version="$version_param"
+        fi
+        [[ "$last_version" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,79}$ ]] || exit 1
+        url="https://github.com/Tommy8mao/v2node/releases/download/${last_version}/${archive_name}"
+        curl --fail --location --silent --show-error "$url" -o "$download_dir/$archive_name" || exit 1
+    fi
+    unzip -tq "$download_dir/$archive_name" >/dev/null || exit 1
     if [[ -e /usr/local/v2node/ ]]; then
         rm -rf /usr/local/v2node/
     fi
-
     mkdir /usr/local/v2node/ -p
-    cd /usr/local/v2node/
-
-    if  [[ -z "$version_param" ]] ; then
-        last_version=$(curl -Ls "https://api.github.com/repos/Tommy8mao/v2node/releases/latest" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/')
-        if [[ ! -n "$last_version" ]]; then
-            echo -e "${red}检测 v2node 版本失败，可能是超出 Github API 限制，请稍后再试，或手动指定 v2node 版本安装${plain}"
-            exit 1
-        fi
-        echo -e "${green}检测到最新版本：${last_version}，开始安装...${plain}"
-        url="https://github.com/Tommy8mao/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
-        curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}下载 v2node 失败，请确保你的服务器能够下载 Github 的文件${plain}"
-            exit 1
-        fi
-    else
-    last_version=$version_param
-        url="https://github.com/Tommy8mao/v2node/releases/download/${last_version}/v2node-linux-${arch}.zip"
-        curl -sL "$url" | pv -s 30M -W -N "下载进度" > /usr/local/v2node/v2node-linux.zip
-        if [[ $? -ne 0 ]]; then
-            echo -e "${red}下载 v2node $1 失败，请确保此版本存在${plain}"
-            exit 1
-        fi
-    fi
-
-    unzip v2node-linux.zip
-    rm v2node-linux.zip -f
+    cd /usr/local/v2node/ || exit 1
+    unzip -oq "$download_dir/$archive_name" || exit 1
+    rm -rf "$download_dir"
     chmod +x v2node
     mkdir /etc/v2node/ -p
     cp geoip.dat /etc/v2node/
@@ -375,8 +390,17 @@ EOF
     fi
 
 
-    curl -o /usr/bin/v2node -Ls https://raw.githubusercontent.com/Tommy8mao/v2node/main/script/v2node.sh
-    chmod +x /usr/bin/v2node
+    if [[ "$PRIVATE_PACKAGES" == true ]]; then
+        local staged_script
+        staged_script=$(mktemp /usr/bin/v2node.new.XXXXXX) || exit 1
+        download_private_file v2node.sh "$staged_script" || { rm -f "$staged_script"; exit 1; }
+        bash -n "$staged_script" || { rm -f "$staged_script"; exit 1; }
+        chmod 0755 "$staged_script" || { rm -f "$staged_script"; exit 1; }
+        mv -f "$staged_script" /usr/bin/v2node || { rm -f "$staged_script"; exit 1; }
+    else
+        curl --fail --location --silent --show-error -o /usr/bin/v2node https://raw.githubusercontent.com/Tommy8mao/v2node/main/script/v2node.sh || exit 1
+        chmod +x /usr/bin/v2node
+    fi
 
     cd $cur_dir
     rm -f install.sh

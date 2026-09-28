@@ -23,6 +23,7 @@ existing_server_key=""
 binary_path=""
 release_repository="${NEXT_V1_RELEASE_REPOSITORY:-$DEFAULT_RELEASE_REPOSITORY}"
 release_version="${NEXT_V1_VERSION:-$DEFAULT_RELEASE_VERSION}"
+private_packages=false
 archive_sha256_amd64="${NEXT_V1_SHA256_AMD64:-}"
 archive_sha256_arm64="${NEXT_V1_SHA256_ARM64:-}"
 api_host=""
@@ -115,6 +116,7 @@ Service options:
   --frontend-port PORT          HAProxy public port (default: 443)
   --backend-port PORT           Loopback v2node port (default: 24443)
   --binary FILE                 Install this v2node binary instead of downloading
+  --private-packages             Download authenticated releases from the panel
   --release-repository REPO     GitHub release repository (default: Tommy8mao/v2node)
   --version TAG                 Install a release tag instead of latest
   --archive-sha256-amd64 HASH   Pin the Linux amd64 release archive
@@ -225,6 +227,8 @@ parse_args() {
                 require_value "$@"; backend_port="$2"; shift 2 ;;
             --binary)
                 require_value "$@"; binary_path="$2"; shift 2 ;;
+            --private-packages)
+                private_packages=true; shift ;;
             --release-repository)
                 require_value "$@"; release_repository="$2"; shift 2 ;;
             --version)
@@ -378,26 +382,36 @@ download_v2node() {
         v2node-linux-arm64-v8a.zip) pinned="$archive_sha256_arm64" ;;
         *) die "no checksum slot for release asset $asset" ;;
     esac
-    if [[ "$release_version" == "latest" ]]; then
-        version_path="latest/download"
+    local -a auth_header=()
+    if [[ "$private_packages" == true ]]; then
+        [[ "$release_version" =~ ^v[0-9A-Za-z][0-9A-Za-z._-]{0,79}$ ]] ||
+            die "private package installation requires a pinned release version"
+        [[ -s "$api_key_file" && "$api_host" =~ ^(https://[^/]+) ]] ||
+            die "private package download requires a panel credential"
+        url="${BASH_REMATCH[1]}/api/v2/server/v2node/install/$release_version/$asset"
+        auth_header=(-H "X-V2node-Install-Key: $(cat "$api_key_file")")
     else
-        version_path="download/$release_version"
+        if [[ "$release_version" == "latest" ]]; then
+            version_path="latest/download"
+        else
+            version_path="download/$release_version"
+        fi
+        url="https://github.com/$release_repository/releases/$version_path/$asset"
     fi
-    url="https://github.com/$release_repository/releases/$version_path/$asset"
     checksum_url="$url.sha256"
     download_dir=$(mktemp -d "${TMPDIR:-/tmp}/next-v1-download.XXXXXX")
     archive="$download_dir/$asset"
     checksum="$archive.sha256"
     extracted="$download_dir/extracted"
     mkdir -p "$extracted"
-    info "Downloading v2node from $release_repository ($release_version)"
+    info "Downloading v2node release $release_version"
     if ! curl --fail --location --silent --show-error --retry 3 \
-          --connect-timeout 15 "$url" -o "$archive"; then
+          --connect-timeout 15 "${auth_header[@]}" "$url" -o "$archive"; then
         rm -rf "$download_dir"
         die "download failed: $url"
     fi
     if ! curl --fail --location --silent --show-error --retry 3 \
-          --connect-timeout 15 "$checksum_url" -o "$checksum"; then
+          --connect-timeout 15 "${auth_header[@]}" "$checksum_url" -o "$checksum"; then
         rm -rf "$download_dir"
         die "checksum download failed: $checksum_url"
     fi

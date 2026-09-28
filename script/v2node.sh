@@ -106,8 +106,56 @@ before_show_menu() {
     show_menu
 }
 
+ensure_jq() {
+    command -v jq >/dev/null 2>&1 && return 0
+    echo -e "${yellow}首次从面板更新需要 jq，正在安装...${plain}"
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get update -y >/dev/null 2>&1 && DEBIAN_FRONTEND=noninteractive apt-get install -y jq >/dev/null 2>&1
+    elif command -v apk >/dev/null 2>&1; then
+        apk add --no-cache jq >/dev/null 2>&1
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y jq >/dev/null 2>&1
+    elif command -v pacman >/dev/null 2>&1; then
+        pacman -Sy --noconfirm --needed jq >/dev/null 2>&1
+    else
+        return 1
+    fi
+    command -v jq >/dev/null 2>&1
+}
+
+panel_install_details() {
+    local config=/etc/v2node/config.json
+    [[ -r "$config" ]] && ensure_jq || {
+        echo -e "${red}缺少节点配置或 jq，无法从面板获取私有安装包${plain}" >&2
+        return 1
+    }
+    panel_api_host=$(jq -er '.Nodes[0].ApiHost | select(type == "string" and length > 0)' "$config") || return 1
+    panel_api_key=$(jq -er '.Nodes[0].ApiKey | select(type == "string" and length > 0)' "$config") || return 1
+    panel_node_id=$(jq -er '.Nodes[0].NodeID | select(type == "number" and . > 0)' "$config") || return 1
+    [[ "$panel_api_host" =~ ^(https://[^/]+) ]] || return 1
+    panel_package_base="${BASH_REMATCH[1]}/api/v2/server/v2node/install"
+}
+
+run_panel_installer() {
+    local version="${1:-}" installer
+    panel_install_details || return 1
+    installer=$(mktemp "${TMPDIR:-/tmp}/v2node-private-install.XXXXXX") || return 1
+    if ! curl --fail --location --silent --show-error --retry 3 \
+          -H "X-V2node-Install-Key: $panel_api_key" \
+          "$panel_package_base/install.sh" -o "$installer"; then
+        rm -f "$installer"
+        return 1
+    fi
+    local args=(--private-packages --package-base-url "$panel_package_base" --api-host "$panel_api_host" --node-id "$panel_node_id" --api-key "$panel_api_key")
+    [[ -z "$version" ]] || args+=("$version")
+    bash "$installer" "${args[@]}"
+    local result=$?
+    rm -f "$installer"
+    return "$result"
+}
+
 install() {
-    bash <(curl -Ls https://raw.githubusercontent.com/Tommy8mao/v2node/main/script/install.sh)
+    run_panel_installer
     if [[ $? == 0 ]]; then
         if [[ $# == 0 ]]; then
             start
@@ -123,7 +171,7 @@ update() {
     else
         version=$2
     fi
-    bash <(curl -Ls https://raw.githubusercontent.com/Tommy8mao/v2node/main/script/install.sh) $version
+    run_panel_installer "$version"
     if [[ $? == 0 ]]; then
         echo -e "${green}更新完成，已自动重启 v2node，请使用 v2node log 查看运行日志${plain}"
         exit
@@ -307,13 +355,20 @@ show_log() {
 }
 
 update_shell() {
-    wget -O /usr/bin/v2node -N --no-check-certificate https://raw.githubusercontent.com/Tommy8mao/v2node/main/script/v2node.sh
-    if [[ $? != 0 ]]; then
+    panel_install_details || return 1
+    local staged_script
+    staged_script=$(mktemp /usr/bin/v2node.new.XXXXXX) || return 1
+    if ! curl --fail --location --silent --show-error --retry 3 \
+        -H "X-V2node-Install-Key: $panel_api_key" \
+        "$panel_package_base/v2node.sh" -o "$staged_script"; then
+        rm -f "$staged_script"
         echo ""
-        echo -e "${red}下载脚本失败，请检查本机能否连接 Github${plain}"
+        echo -e "${red}下载脚本失败，请检查本机能否连接面板${plain}"
         before_show_menu
     else
-        chmod +x /usr/bin/v2node
+        bash -n "$staged_script" || { rm -f "$staged_script"; return 1; }
+        chmod 0755 "$staged_script" || { rm -f "$staged_script"; return 1; }
+        mv -f "$staged_script" /usr/bin/v2node || { rm -f "$staged_script"; return 1; }
         echo -e "${green}升级脚本成功，请重新运行脚本${plain}" && exit 0
     fi
 }
